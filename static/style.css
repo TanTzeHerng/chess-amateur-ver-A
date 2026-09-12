@@ -210,3 +210,21 @@ input[type="number"] {
 .tag { display: inline-block; padding: .1rem .45rem; border: 1px solid var(--white); font-size: .78rem; color: var(--white); }
 .tag-live { border-color: var(--green); color: var(--green); }
 .empty { text-align: center; color: var(--cyan); margin-top: 3rem; }
+
+/* ---- mode / time-control controls (8-color palette) ---- */
+.mode-choice, .tc-choice { border: 1px solid var(--green); margin-top: .5rem; }
+.mode-choice label, .tc-choice label { display: inline-block; margin-right: .5rem; }
+.tc-inputs { margin-top: .4rem; color: var(--white); }
+.tc-base, .tc-inc { margin: .2rem 0; }
+.tc-base span, .tc-inc label { color: var(--white); }
+.tc-inputs input[type="number"] { width: 3.2rem; }
+.tc-inputs.disabled { opacity: 1; }          /* no opacity blends; hide instead */
+.tc-inputs[hidden] { display: none !important; }
+
+/* ---- clocks ---- */
+.clock-block { border: 2px solid var(--yellow); background: var(--black); padding: .5rem; margin-bottom: .8rem; }
+.clock { display: flex; justify-content: space-between; align-items: center; font-size: 1.3rem; padding: .2rem .3rem; color: var(--white); }
+.clock-label { color: var(--cyan); font-size: .9rem; }
+.clock-time { font-family: ui-monospace, monospace; color: var(--white); }
+.clock.active .clock-time { color: var(--green); }     /* side to move */
+.clock.low .clock-time { color: var(--red); }           /* under 10s */

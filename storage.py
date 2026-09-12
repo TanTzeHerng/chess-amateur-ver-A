@@ -102,6 +102,12 @@ class Store:
                 " id SERIAL PRIMARY KEY,"
                 " username TEXT UNIQUE NOT NULL,"
                 " password_hash TEXT NOT NULL,"
+                " fide_blitz DOUBLE PRECISION NOT NULL DEFAULT 1400,"
+                " fide_rapid DOUBLE PRECISION NOT NULL DEFAULT 1400,"
+                " fide_classical DOUBLE PRECISION NOT NULL DEFAULT 1400,"
+                " rated_rating DOUBLE PRECISION NOT NULL DEFAULT 0,"
+                " rated_rd DOUBLE PRECISION NOT NULL DEFAULT 350,"
+                " rated_vol DOUBLE PRECISION NOT NULL DEFAULT 0.06,"
                 " created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
             )
             games_sql = (
@@ -113,6 +119,11 @@ class Store:
                 " result TEXT,"
                 " result_reason TEXT,"
                 " moves TEXT NOT NULL,"
+                " base_seconds INTEGER,"          # time control base (NULL = unlimited)
+                " increment INTEGER NOT NULL DEFAULT 0,"
+                " clock_white DOUBLE PRECISION,"  # live remaining seconds (NULL = unlimited)
+                " clock_black DOUBLE PRECISION,"
+                " rating_delta TEXT,"             # self-describing, e.g. '+1' or '+1 FIDE rapid'
                 " started_at TIMESTAMPTZ NOT NULL,"
                 " ended_at TIMESTAMPTZ,"
                 " created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
@@ -129,6 +140,12 @@ class Store:
                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                 " username TEXT UNIQUE NOT NULL,"
                 " password_hash TEXT NOT NULL,"
+                " fide_blitz REAL NOT NULL DEFAULT 1400,"
+                " fide_rapid REAL NOT NULL DEFAULT 1400,"
+                " fide_classical REAL NOT NULL DEFAULT 1400,"
+                " rated_rating REAL NOT NULL DEFAULT 0,"
+                " rated_rd REAL NOT NULL DEFAULT 350,"
+                " rated_vol REAL NOT NULL DEFAULT 0.06,"
                 " created_at TEXT NOT NULL DEFAULT (datetime('now')))"
             )
             games_sql = (
@@ -140,6 +157,11 @@ class Store:
                 " result TEXT,"
                 " result_reason TEXT,"
                 " moves TEXT NOT NULL,"
+                " base_seconds INTEGER,"
+                " increment INTEGER NOT NULL DEFAULT 0,"
+                " clock_white REAL,"
+                " clock_black REAL,"
+                " rating_delta TEXT,"
                 " started_at TEXT NOT NULL,"
                 " ended_at TEXT,"
                 " created_at TEXT NOT NULL DEFAULT (datetime('now')))"
@@ -155,9 +177,73 @@ class Store:
             cur.execute(games_sql)
             cur.execute(index_sql)
             conn.commit()
+            # Idempotent migration: add columns introduced after the original
+            # accounts release, so an EXISTING database (whose users/games
+            # tables predate time-controls/ratings) gains them WITHOUT dropping
+            # data. CREATE TABLE IF NOT EXISTS alone never alters existing
+            # tables, so this is required for a clean upgrade on Render Postgres.
+            self._migrate_columns(conn, cur)
+            conn.commit()
         finally:
             if self.backend == "postgres":
                 conn.close()
+
+    # -- migration ---------------------------------------------------------
+
+    # Columns added after the original accounts release, with per-backend types.
+    # (column_name, postgres_type, sqlite_type, default_clause_or_None)
+    _MIGRATION_COLUMNS = {
+        "users": [
+            ("fide_blitz", "DOUBLE PRECISION", "REAL", "1400"),
+            ("fide_rapid", "DOUBLE PRECISION", "REAL", "1400"),
+            ("fide_classical", "DOUBLE PRECISION", "REAL", "1400"),
+            ("rated_rating", "DOUBLE PRECISION", "REAL", "0"),
+            ("rated_rd", "DOUBLE PRECISION", "REAL", "350"),
+            ("rated_vol", "DOUBLE PRECISION", "REAL", "0.06"),
+        ],
+        "games": [
+            ("base_seconds", "INTEGER", "INTEGER", None),
+            ("increment", "INTEGER", "INTEGER", "0"),
+            ("clock_white", "DOUBLE PRECISION", "REAL", None),
+            ("clock_black", "DOUBLE PRECISION", "REAL", None),
+            ("rating_delta", "TEXT", "TEXT", None),
+        ],
+    }
+
+    def _existing_columns(self, cur, table):
+        """Return the set of column names currently on `table`."""
+        if self.backend == "postgres":
+            cur.execute(
+                "SELECT column_name FROM information_schema.columns"
+                " WHERE table_name = %s", (table,))
+            return {r[0] for r in cur.fetchall()}
+        # sqlite
+        cur.execute("PRAGMA table_info(%s)" % table)
+        return {r[1] for r in cur.fetchall()}
+
+    def _migrate_columns(self, conn, cur):
+        """Add any missing post-release columns to users/games (idempotent).
+
+        Postgres supports ADD COLUMN IF NOT EXISTS; SQLite does not, so we
+        check PRAGMA table_info first. Newly added columns get their default so
+        existing rows are backfilled (e.g. old users become 1400 FIDE / 0
+        Rated; old games get increment 0). Safe to run on every boot.
+        """
+        for table, cols in self._MIGRATION_COLUMNS.items():
+            existing = self._existing_columns(cur, table)
+            for name, pg_type, sq_type, default in cols:
+                if name in existing:
+                    continue
+                col_type = pg_type if self.backend == "postgres" else sq_type
+                ddl = "ALTER TABLE %s ADD COLUMN %s %s" % (table, name, col_type)
+                if default is not None:
+                    ddl += " DEFAULT %s" % default
+                try:
+                    cur.execute(ddl)
+                except Exception as exc:  # pragma: no cover - defensive
+                    # A concurrent boot may have added it; ignore "exists".
+                    print("[storage] migration note for %s.%s: %s"
+                          % (table, name, exc))
 
     # -- helpers -----------------------------------------------------------
 
@@ -221,13 +307,38 @@ class Store:
         return {"id": row[0], "username": row[1], "password_hash": row[2]}
 
     def get_user_by_id(self, user_id):
+        """Return the user including all rating fields, or None."""
         ph = self._placeholder()
         row = self._execute(
-            "SELECT id, username FROM users WHERE id = %s" % ph,
+            "SELECT id, username, fide_blitz, fide_rapid, fide_classical,"
+            " rated_rating, rated_rd, rated_vol FROM users WHERE id = %s" % ph,
             (user_id,), fetch="one")
         if not row:
             return None
-        return {"id": row[0], "username": row[1]}
+        return {
+            "id": row[0], "username": row[1],
+            "fide_blitz": float(row[2]), "fide_rapid": float(row[3]),
+            "fide_classical": float(row[4]),
+            "rated_rating": float(row[5]), "rated_rd": float(row[6]),
+            "rated_vol": float(row[7]),
+        }
+
+    def update_fide_rating(self, user_id, time_class, new_rating):
+        """Set the user's FIDE rating for a given time_class
+        (blitz/rapid/classical)."""
+        col = {"blitz": "fide_blitz", "rapid": "fide_rapid",
+               "classical": "fide_classical"}[time_class]
+        ph = self._placeholder()
+        self._execute("UPDATE users SET %s = %s WHERE id = %s" % (col, ph, ph),
+                      (new_rating, user_id), commit=True)
+
+    def update_rated_rating(self, user_id, rating, rd, vol):
+        """Set the user's Glicko-2 (rating, RD, volatility) for Rated mode."""
+        ph = self._placeholder()
+        self._execute(
+            "UPDATE users SET rated_rating = %s, rated_rd = %s, rated_vol = %s"
+            " WHERE id = %s" % (ph, ph, ph, ph),
+            (rating, rd, vol, user_id), commit=True)
 
     # -- game operations ---------------------------------------------------
 
@@ -235,35 +346,46 @@ class Store:
         """Return the user's single in-progress game, or None."""
         ph = self._placeholder()
         row = self._execute(
-            "SELECT id, human_color, moves, started_at FROM games"
-            " WHERE user_id = %s AND status = 'in_progress'"
+            "SELECT id, human_color, moves, started_at, base_seconds, increment,"
+            " clock_white, clock_black"
+            " FROM games WHERE user_id = %s AND status = 'in_progress'"
             " ORDER BY id DESC LIMIT 1" % ph,
             (user_id,), fetch="one")
         if not row:
             return None
+        clock = None
+        if row[6] is not None and row[7] is not None:
+            clock = {"white": float(row[6]), "black": float(row[7])}
         return {
             "id": row[0],
             "human_color": row[1],
             "moves": (row[2].split() if row[2] else []),
             "started_at": str(row[3]),
+            "base_seconds": (int(row[4]) if row[4] is not None else None),
+            "increment": int(row[5]) if row[5] is not None else 0,
+            "clock": clock,
         }
 
     def upsert_in_progress_game(self, user_id, game_id, human_color,
-                                moves_uci, started_at):
+                                moves_uci, started_at,
+                                base_seconds=None, increment=0,
+                                clock_white=None, clock_black=None):
         """Create or update the user's in-progress game (autosave).
 
-        If game_id is given and belongs to the user, update its move list.
-        Otherwise create a new in-progress row (the partial unique index
-        guarantees only one active game per user). Returns the game id.
+        If game_id is given and belongs to the user, update its move list AND
+        the live remaining clocks (so a resumed game continues with the correct
+        times). Otherwise create a new in-progress row. Returns the game id.
         """
         ph = self._placeholder()
         moves_str = " ".join(moves_uci or [])
-        # Update path.
+        # Update path (also persists the live clocks).
         if game_id is not None:
             self._execute(
-                "UPDATE games SET moves = %s WHERE id = %s AND user_id = %s"
-                " AND status = 'in_progress'" % (ph, ph, ph),
-                (moves_str, game_id, user_id), commit=True)
+                "UPDATE games SET moves = %s, clock_white = %s, clock_black = %s"
+                " WHERE id = %s AND user_id = %s AND status = 'in_progress'"
+                % (ph, ph, ph, ph, ph),
+                (moves_str, clock_white, clock_black, game_id, user_id),
+                commit=True)
             # Confirm it actually updated a row we own; if not, fall through
             # to insert.
             check = self._execute(
@@ -274,10 +396,13 @@ class Store:
                 return check[0]
         # Insert path.
         sql = (
-            "INSERT INTO games (user_id, human_color, status, moves, started_at)"
-            " VALUES (%s, %s, 'in_progress', %s, %s)" % (ph, ph, ph, ph)
+            "INSERT INTO games (user_id, human_color, status, moves, started_at,"
+            " base_seconds, increment, clock_white, clock_black)"
+            " VALUES (%s, %s, 'in_progress', %s, %s, %s, %s, %s, %s)"
+            % (ph, ph, ph, ph, ph, ph, ph, ph)
         )
-        params = (user_id, human_color, moves_str, started_at)
+        params = (user_id, human_color, moves_str, started_at,
+                  base_seconds, increment, clock_white, clock_black)
         if self.backend == "postgres":
             row = self._execute(sql + " RETURNING id", params,
                                 fetch="one", commit=True)
@@ -291,7 +416,8 @@ class Store:
                 return cur.lastrowid
 
     def finish_game(self, user_id, game_id, human_color, result, result_reason,
-                    moves_uci, started_at, ended_at):
+                    moves_uci, started_at, ended_at,
+                    base_seconds=None, increment=0, rating_delta=None):
         """Finalize a game (real result or resignation): set status='finished',
         the final move list, result, result_reason, and ended_at (to the
         second). Works whether or not an in-progress row already exists.
@@ -302,10 +428,11 @@ class Store:
         if game_id is not None:
             self._execute(
                 "UPDATE games SET status = 'finished', moves = %s, result = %s,"
-                " result_reason = %s, ended_at = %s"
+                " result_reason = %s, ended_at = %s, rating_delta = %s"
                 " WHERE id = %s AND user_id = %s AND status = 'in_progress'"
-                % (ph, ph, ph, ph, ph, ph),
-                (moves_str, result, result_reason, ended_at, game_id, user_id),
+                % (ph, ph, ph, ph, ph, ph, ph),
+                (moves_str, result, result_reason, ended_at, rating_delta,
+                 game_id, user_id),
                 commit=True)
             check = self._execute(
                 "SELECT id FROM games WHERE id = %s AND user_id = %s"
@@ -316,12 +443,13 @@ class Store:
         # an in-progress row was written): insert a finished row directly.
         sql = (
             "INSERT INTO games (user_id, human_color, status, result,"
-            " result_reason, moves, started_at, ended_at)"
-            " VALUES (%s, %s, 'finished', %s, %s, %s, %s, %s)"
-            % (ph, ph, ph, ph, ph, ph, ph)
+            " result_reason, moves, started_at, ended_at, base_seconds,"
+            " increment, rating_delta)"
+            " VALUES (%s, %s, 'finished', %s, %s, %s, %s, %s, %s, %s, %s)"
+            % (ph, ph, ph, ph, ph, ph, ph, ph, ph, ph)
         )
         params = (user_id, human_color, result, result_reason, moves_str,
-                  started_at, ended_at)
+                  started_at, ended_at, base_seconds, increment, rating_delta)
         if self.backend == "postgres":
             row = self._execute(sql + " RETURNING id", params,
                                 fetch="one", commit=True)
@@ -339,40 +467,36 @@ class Store:
         ph = self._placeholder()
         rows = self._execute(
             "SELECT id, human_color, status, result, result_reason, moves,"
-            " started_at, ended_at FROM games WHERE user_id = %s"
+            " started_at, ended_at, base_seconds, increment, rating_delta"
+            " FROM games WHERE user_id = %s"
             " ORDER BY started_at DESC, id DESC" % ph,
             (user_id,), fetch="all") or []
-        out = []
-        for r in rows:
-            out.append({
-                "id": r[0],
-                "human_color": r[1],
-                "status": r[2],
-                "result": r[3],
-                "result_reason": r[4],
-                "moves": (r[5].split() if r[5] else []),
-                "started_at": str(r[6]),
-                "ended_at": (str(r[7]) if r[7] is not None else None),
-            })
-        return out
+        return [self._game_row_to_dict(r) for r in rows]
 
     def get_game(self, user_id, game_id):
         """Return a single game owned by user_id, or None."""
         ph = self._placeholder()
         row = self._execute(
             "SELECT id, human_color, status, result, result_reason, moves,"
-            " started_at, ended_at FROM games WHERE user_id = %s AND id = %s"
-            % (ph, ph),
+            " started_at, ended_at, base_seconds, increment, rating_delta"
+            " FROM games WHERE user_id = %s AND id = %s" % (ph, ph),
             (user_id, game_id), fetch="one")
         if not row:
             return None
+        return self._game_row_to_dict(row)
+
+    @staticmethod
+    def _game_row_to_dict(r):
         return {
-            "id": row[0],
-            "human_color": row[1],
-            "status": row[2],
-            "result": row[3],
-            "result_reason": row[4],
-            "moves": (row[5].split() if row[5] else []),
-            "started_at": str(row[6]),
-            "ended_at": (str(row[7]) if row[7] is not None else None),
+            "id": r[0],
+            "human_color": r[1],
+            "status": r[2],
+            "result": r[3],
+            "result_reason": r[4],
+            "moves": (r[5].split() if r[5] else []),
+            "started_at": str(r[6]),
+            "ended_at": (str(r[7]) if r[7] is not None else None),
+            "base_seconds": (int(r[8]) if r[8] is not None else None),
+            "increment": (int(r[9]) if r[9] is not None else 0),
+            "rating_delta": r[10],
         }

@@ -45,6 +45,37 @@
           <label><input type="radio" name="color" value="white" checked /> White</label>
           <label><input type="radio" name="color" value="black" /> Black</label>
         </fieldset>
+
+        <fieldset class="mode-choice">
+          <legend>Mode</legend>
+          {% if user %}
+          <label><input type="radio" name="mode" value="fide" /> FIDE-rated</label>
+          <label><input type="radio" name="mode" value="rated" /> Rated</label>
+          <label><input type="radio" name="mode" value="casual" checked /> Casual</label>
+          {% else %}
+          <label><input type="radio" name="mode" value="casual" checked /> Casual (guest)</label>
+          <p class="hint">Log in for FIDE-rated and Rated modes.</p>
+          {% endif %}
+        </fieldset>
+
+        <fieldset class="tc-choice">
+          <legend>Time control</legend>
+          <label><input type="radio" name="tc" value="custom" checked /> Custom</label>
+          <label><input type="radio" name="tc" value="unlimited" /> Unlimited</label>
+          <div class="tc-inputs" id="tcInputs">
+            <div class="tc-base">
+              <span>Base</span>
+              <input type="number" id="tcH" min="0" value="0" title="hours" /> h
+              <input type="number" id="tcM" min="0" value="3" title="minutes" /> m
+              <input type="number" id="tcS" min="0" value="0" title="seconds" /> s
+            </div>
+            <div class="tc-inc">
+              <label for="tcInc">Increment</label>
+              <input type="number" id="tcInc" min="0" value="2" /> s
+            </div>
+          </div>
+        </fieldset>
+
         <div class="threads-choice">
           <label for="threads">Engine threads</label>
           <input type="number" id="threads" name="threads" value="{{ default_threads }}" min="1" max="128" step="1" />
@@ -52,6 +83,11 @@
         </div>
         <button id="newGame" type="button" class="btn">New Game</button>
         <button id="resignBtn" type="button" class="btn btn-danger" hidden>Resign</button>
+      </div>
+
+      <div class="clock-block" id="clockBlock" hidden>
+        <div class="clock" id="clockTop"><span class="clock-label" id="clockTopLabel"></span> <span class="clock-time" id="clockTopTime">--:--</span></div>
+        <div class="clock" id="clockBottom"><span class="clock-label" id="clockBottomLabel"></span> <span class="clock-time" id="clockBottomTime">--:--</span></div>
       </div>
 
       <div class="status-block">

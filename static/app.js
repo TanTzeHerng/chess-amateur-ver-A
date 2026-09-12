@@ -32,6 +32,13 @@ const promoOverlay = document.getElementById("promoOverlay");
 const promoChoices = document.getElementById("promoChoices");
 const threadsInput = document.getElementById("threads");
 const threadsBadge = document.getElementById("threadsBadge");
+// clocks
+const clockBlock = document.getElementById("clockBlock");
+const clockTopLabel = document.getElementById("clockTopLabel");
+const clockTopTime = document.getElementById("clockTopTime");
+const clockBottomLabel = document.getElementById("clockBottomLabel");
+const clockBottomTime = document.getElementById("clockBottomTime");
+const tcInputs = document.getElementById("tcInputs");
 // settings + replay
 const animToggle = document.getElementById("animToggle");
 const soundToggle = document.getElementById("soundToggle");
@@ -51,6 +58,15 @@ let humanColor = "white";
 let threadsCount = CFG.defaultThreads || 128;
 let startedAt = null;
 let inProgress = false;
+// clock / mode / time-control state
+let mode = "casual";
+let baseSeconds = null;    // null => unlimited (no clock)
+let increment = 0;
+let clockState = null;     // {white, black} remaining seconds, or null (unlimited)
+let clockTicker = null;    // setInterval handle for the display countdown
+let humanClockRunning = false;   // fairness: true only from CA-animation-end until the human moves
+let humanTurnStart = 0;    // performance.now() when the human's clock resumed
+let humanClockAtResume = 0;      // human's remaining seconds at the moment his clock resumed
 let selected = null;
 let legalFrom = {};
 let busy = false;
@@ -192,6 +208,116 @@ function renderResign() {
   resignBtn.hidden = !(inProgress && state && !state.game_over && !replayMode);
 }
 
+// -------------------------------------------------------------------------
+// Clocks + fairness rule
+// -------------------------------------------------------------------------
+function fmtClock(sec) {
+  if (sec == null) return "--:--";
+  sec = Math.max(0, sec);
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  if (m >= 60) {
+    const h = Math.floor(m / 60);
+    return h + ":" + String(m % 60).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+  }
+  return m + ":" + String(s).padStart(2, "0");
+}
+
+// Live remaining for the human, accounting for time elapsed since his clock
+// resumed (only while humanClockRunning). Bot clock is whatever the server set.
+function liveHumanRemaining() {
+  if (!clockState) return null;
+  let rem = clockState[humanColor];
+  if (humanClockRunning) {
+    rem = humanClockAtResume - (performance.now() - humanTurnStart) / 1000;
+  }
+  return rem;
+}
+
+function renderClocks() {
+  if (!clockBlock) return;
+  if (!clockState || replayMode) { clockBlock.hidden = true; return; }
+  clockBlock.hidden = false;
+  const botColor = humanColor === "white" ? "black" : "white";
+  // Top = opponent (Chess Amateur), bottom = human.
+  clockTopLabel.textContent = BOT_NAME;
+  clockBottomLabel.textContent = "You";
+  const humanRem = liveHumanRemaining();
+  clockBottomTime.textContent = fmtClock(humanRem);
+  clockTopTime.textContent = fmtClock(clockState[botColor]);
+  // active/low styling
+  const bottomEl = clockBottomTime.parentElement;
+  const topEl = clockTopTime.parentElement;
+  bottomEl.className = "clock" + (humanClockRunning ? " active" : "") + (humanRem != null && humanRem < 10 ? " low" : "");
+  topEl.className = "clock" + (!humanClockRunning && state && !state.game_over ? " active" : "") + (clockState[botColor] != null && clockState[botColor] < 10 ? " low" : "");
+}
+
+function startClockTicker() {
+  stopClockTicker();
+  if (!clockState) return;
+  clockTicker = setInterval(() => {
+    renderClocks();
+    // Client-side flag: if the human's live clock hits 0 while running, submit
+    // a forfeit by sending a move attempt with the elapsed >= remaining. We
+    // simply let the server enforce it on the next move; to end promptly we
+    // trigger a "timeout" move with a null move so the server flags. Simpler:
+    // once it hits 0, stop the human clock and show the loss locally; the
+    // server will finalize on the next interaction. To be safe we auto-submit.
+    const rem = liveHumanRemaining();
+    if (humanClockRunning && rem != null && rem <= 0) {
+      humanClockRunning = false;
+      submitTimeout();
+    }
+  }, 200);
+}
+function stopClockTicker() {
+  if (clockTicker) { clearInterval(clockTicker); clockTicker = null; }
+}
+
+// The human's clock RESUMES (starts counting) only after Chess Amateur's move
+// animation has ended and it is the human's turn (fairness rule).
+function resumeHumanClock() {
+  if (!clockState || !state || state.game_over || replayMode) return;
+  if (state.turn !== humanColor) return;
+  humanClockAtResume = clockState[humanColor];
+  humanTurnStart = performance.now();
+  humanClockRunning = true;
+  renderClocks();
+}
+
+// Stop the human clock the instant he moves; returns the elapsed seconds to
+// send to the server (which is authoritative + clamps/flags).
+function stopHumanClockAndGetElapsed() {
+  if (!humanClockRunning) return 0;
+  const elapsed = (performance.now() - humanTurnStart) / 1000;
+  humanClockRunning = false;
+  // reflect locally (server will return the authoritative value)
+  if (clockState) clockState[humanColor] = Math.max(0, humanClockAtResume - elapsed);
+  renderClocks();
+  return elapsed;
+}
+
+async function submitTimeout() {
+  // Human flagged locally: tell the server via a move with huge elapsed so it
+  // finalizes as a time forfeit. We send the last legal-looking move field but
+  // the server flags before applying it (elapsed >= remaining).
+  if (busy || !state || !clockState) return;
+  setBusy(true);
+  try {
+    const res = await fetch("/api/move", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        game_id: state.game_id, move: "0000", moves: moves,
+        human_color: humanColor, threads: threadsCount, mode: mode,
+        base_seconds: baseSeconds, increment: increment,
+        clock: clockState, elapsed: 1e9, started_at: startedAt,
+      }),
+    });
+    if (res.ok) { adoptState(await res.json()); renderAll(); afterMoveResolved(); }
+  } catch (e) { /* ignore */ }
+  finally { setBusy(false); }
+}
+
 function renderAll() {
   rebuildLegalMap();
   renderBoard();
@@ -200,6 +326,7 @@ function renderAll() {
   renderBanner();
   renderThreadsBadge();
   renderResign();
+  renderClocks();
 }
 
 // =========================================================================
@@ -290,6 +417,11 @@ function adoptState(s) {
   if (typeof s.human_color === "string") humanColor = s.human_color;
   if (typeof s.started_at === "string") startedAt = s.started_at;
   inProgress = !!s.in_progress;
+  if (typeof s.mode === "string") mode = s.mode;
+  if ("base_seconds" in s) baseSeconds = s.base_seconds;
+  if ("increment" in s) increment = s.increment || 0;
+  // Absorb the authoritative clock from the server (null => unlimited).
+  if ("clock" in s) clockState = s.clock ? { white: s.clock.white, black: s.clock.black } : null;
 }
 
 // FEN "side to move" after applying our moves lets us detect check via the
@@ -320,6 +452,11 @@ function playMoveSounds(prev, next) {
 
 async function sendMove(uci, fromSq, toSq) {
   if (busy || !state) return;
+  // Fairness rule: stop the human's clock the INSTANT he commits the move and
+  // capture the elapsed time NOW (before any animation), so the slide/network
+  // don't eat into his clock. Server is authoritative and clamps/flags.
+  const elapsed = stopHumanClockAndGetElapsed();
+  const clockSnapshot = clockState ? { white: clockState.white, black: clockState.black } : null;
   setBusy(true); selected = null; clearMessage();
   // Animate the human's piece sliding first (if enabled), then post.
   const doPost = async () => {
@@ -329,6 +466,8 @@ async function sendMove(uci, fromSq, toSq) {
         body: JSON.stringify({
           game_id: state.game_id, move: uci, moves: moves,
           human_color: humanColor, threads: threadsCount, started_at: startedAt,
+          mode: mode, base_seconds: baseSeconds, increment: increment,
+          clock: clockSnapshot, elapsed: elapsed,
         }),
       });
       if (res.status === 400) { showMessage("Illegal move. Try a different move."); renderBoard(); return; }
@@ -360,12 +499,14 @@ async function sendMove(uci, fromSq, toSq) {
             adoptState(next);            // commit final position
             renderAll();
             playBotResolutionSound(next);
+            afterMoveResolved();         // fairness: resume human clock now
           });
         } else {
           // Couldn't get the intermediate position: just show the result.
           adoptState(next);
           renderAll();
           playBotResolutionSound(next);
+          afterMoveResolved();
         }
       } else {
         // No animation (or no bot reply): render final state and play a single
@@ -373,6 +514,7 @@ async function sendMove(uci, fromSq, toSq) {
         adoptState(next);
         renderAll();
         playMoveSounds(null, next);
+        afterMoveResolved();
       }
     } catch (e) {
       showMessage("Network error. Please try again.");
@@ -398,6 +540,26 @@ function playBotResolutionSound(next) {
   }
 }
 
+// Called once a move (and Chess Amateur's animated reply) has fully resolved.
+// Handles game-over (show rating delta, stop clocks) or resumes the human's
+// clock per the fairness rule.
+function afterMoveResolved() {
+  if (state && state.game_over) {
+    stopClockTicker();
+    humanClockRunning = false;
+    showRatingDelta(state.rating_delta);
+    return;
+  }
+  // Fairness: the human's clock only starts now (after CA's animation ended).
+  if (clockState) { resumeHumanClock(); startClockTicker(); }
+}
+
+function showRatingDelta(delta) {
+  if (!delta) return;   // casual / guest -> nothing to show
+  // delta is a self-describing string, e.g. "+6.40 FIDE classical" or "-12.34".
+  showMessage("Rating change: " + delta);
+}
+
 function chosenThreads() {
   let n = parseInt(threadsInput && threadsInput.value, 10);
   if (!Number.isFinite(n)) n = CFG.defaultThreads || 128;
@@ -406,17 +568,37 @@ function chosenThreads() {
   return n;
 }
 
+// Read mode + time control from the controls for a new game.
+function chosenMode() {
+  const el = document.querySelector('input[name="mode"]:checked');
+  return el ? el.value : "casual";
+}
+function chosenTimeControl() {
+  const tcEl = document.querySelector('input[name="tc"]:checked');
+  if (tcEl && tcEl.value === "unlimited") return { unlimited: true };
+  const h = parseInt((document.getElementById("tcH") || {}).value, 10) || 0;
+  const m = parseInt((document.getElementById("tcM") || {}).value, 10) || 0;
+  const s = parseInt((document.getElementById("tcS") || {}).value, 10) || 0;
+  const inc = parseInt((document.getElementById("tcInc") || {}).value, 10) || 0;
+  return { unlimited: false, hours: h, minutes: m, seconds: s, increment: inc };
+}
+
 async function newGame() {
   exitReplay();
+  stopClockTicker();
   const chosen = document.querySelector('input[name="color"]:checked');
   humanColor = chosen ? chosen.value : "white";
   threadsCount = chosenThreads();
-  moves = []; startedAt = null;
+  mode = chosenMode();
+  const tc = chosenTimeControl();
+  moves = []; startedAt = null; clockState = null; humanClockRunning = false;
   setBusy(true); selected = null; clearMessage(); bannerEl.hidden = true;
   try {
+    const body = Object.assign(
+      { human_color: humanColor, threads: threadsCount, mode: mode }, tc);
     const res = await fetch("/api/new", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ human_color: humanColor, threads: threadsCount }),
+      body: JSON.stringify(body),
     });
     if (res.status === 409) {
       const data = await res.json();
@@ -424,11 +606,17 @@ async function newGame() {
       await resumeInProgress();
       return;
     }
+    if (res.status === 400) {
+      // e.g. the correspondence-chess message for >= 1 day.
+      const data = await res.json();
+      showMessage((data && data.error) || "Invalid time control.");
+      return;
+    }
     if (!res.ok) { showMessage("Could not start a new game (" + res.status + ")."); return; }
     adoptState(await res.json());
     renderAll();
-    // If bot (white) opened, knock for it.
     if (state.last_bot_move && CASettings.sound) CASound.move();
+    afterMoveResolved();   // start the human clock (fairness) once it's his turn
   } catch (e) {
     showMessage("Network error starting game.");
   } finally { setBusy(false); }
@@ -438,19 +626,25 @@ async function resign() {
   if (busy || !inProgress) return;
   if (!window.confirm("Resign this game? It will be recorded as a loss.")) return;
   setBusy(true);
+  stopClockTicker(); humanClockRunning = false;
   try {
-    const res = await fetch("/api/resign", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    const res = await fetch("/api/resign", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode: mode }),
+    });
     if (!res.ok) { showMessage("Could not resign (" + res.status + ")."); return; }
+    const data = await res.json();
     inProgress = false;
     if (state) {
       state.game_over = true;
-      state.result = humanColor === "white" ? "0-1" : "1-0";
+      state.result = data.result || (humanColor === "white" ? "0-1" : "1-0");
       state.result_reason = "resignation";
       state.legal_moves = [];
     }
     renderAll();
     if (CASettings.sound) CASound.loss();
-    showMessage("You resigned. See it in \u201CMy games\u201D.");
+    if (data.rating_delta) showMessage("You resigned. Rating change: " + data.rating_delta);
+    else showMessage("You resigned. See it in \u201CMy games\u201D.");
   } catch (e) {
     showMessage("Network error resigning.");
   } finally { setBusy(false); }
@@ -463,12 +657,12 @@ async function resumeInProgress() {
     const data = await res.json();
     if (!data.in_progress) return false;
     const g = data.in_progress;
-    await renderFromMoves(g.moves || [], g.human_color, g.started_at, true);
+    await renderFromMoves(g.moves || [], g.human_color, g.started_at, true, g);
     return true;
   } catch (e) { return false; }
 }
 
-async function renderFromMoves(moveList, color, started, live) {
+async function renderFromMoves(moveList, color, started, live, resumeInfo) {
   const res = await fetch("/api/view", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ moves: moveList, human_color: color }),
@@ -481,7 +675,23 @@ async function renderFromMoves(moveList, color, started, live) {
   startedAt = started || s.started_at;
   inProgress = !!live;
   replayMode = false;
+  // Restore mode/time-control + the LIVE clock for a resumed game. The server
+  // persists each side's remaining time on every autosave, so a resumed game
+  // continues with the correct clock rather than restarting at the base time.
+  if (live && resumeInfo) {
+    baseSeconds = resumeInfo.base_seconds != null ? resumeInfo.base_seconds : null;
+    increment = resumeInfo.increment || 0;
+    if (baseSeconds == null) {
+      clockState = null;                 // unlimited
+    } else if (resumeInfo.clock && resumeInfo.clock.white != null) {
+      clockState = { white: resumeInfo.clock.white, black: resumeInfo.clock.black };
+    } else {
+      clockState = { white: baseSeconds, black: baseSeconds };  // fallback
+    }
+    humanClockRunning = false;
+  }
   renderAll();
+  if (live) afterMoveResolved();   // resume the human clock if it's his turn
 }
 
 // =========================================================================
