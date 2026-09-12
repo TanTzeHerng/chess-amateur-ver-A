@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>My games &middot; {{ bot_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <h1><span class="bot-name">{{ bot_name }}</span> &middot; My games</h1>
+    <nav class="account-nav">
+      <span class="who">Signed in as <strong>{{ user.username }}</strong></span>
+      <a class="navlink" href="{{ url_for('index') }}">&larr; Board</a>
+      <button id="logoutBtn" type="button" class="navlink btnlink">Log out</button>
+    </nav>
+  </header>
+
+  <main class="history-layout">
+    {% if not games %}
+      <p class="empty">No games yet. <a href="{{ url_for('index') }}">Play one!</a></p>
+    {% else %}
+    <table class="history-table">
+      <thead>
+        <tr>
+          <th>Started</th><th>Ended</th><th>You played</th>
+          <th>Status</th><th>Result</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for g in games %}
+        <tr>
+          <td class="mono">{{ g.started_at }}</td>
+          <td class="mono">{{ g.ended_at if g.ended_at else '—' }}</td>
+          <td>{{ g.human_color | capitalize }}</td>
+          <td>
+            {% if g.status == 'in_progress' %}
+              <span class="tag tag-live">In progress</span>
+            {% else %}
+              <span class="tag">Finished</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if g.status == 'in_progress' %}
+              &mdash;
+            {% else %}
+              {% set human_white = (g.human_color == 'white') %}
+              {% if g.result == '1/2-1/2' %}
+                Draw ({{ g.result_reason }})
+              {% elif (g.result == '1-0' and human_white) or (g.result == '0-1' and not human_white) %}
+                Win ({{ g.result_reason }})
+              {% else %}
+                Loss ({{ g.result_reason }})
+              {% endif %}
+            {% endif %}
+          </td>
+          <td>
+            {% if g.status == 'in_progress' %}
+              <a class="btn btn-small" href="{{ url_for('index') }}">Resume</a>
+            {% else %}
+              <a class="btn btn-small" href="{{ url_for('index') }}?replay={{ g.id }}">Replay</a>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </main>
+
+  <script src="{{ url_for('static', filename='auth.js') }}"></script>
+</body>
+</html>

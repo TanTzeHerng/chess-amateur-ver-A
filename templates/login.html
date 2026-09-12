@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ 'Sign up' if mode == 'register' else 'Log in' }} &middot; {{ bot_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <h1><span class="bot-name">{{ bot_name }}</span></h1>
+    <nav class="account-nav"><a class="navlink" href="{{ url_for('index') }}">&larr; Back to board</a></nav>
+  </header>
+
+  <main class="auth-layout">
+    <form class="auth-card" id="authForm" data-mode="{{ mode }}">
+      <h2 id="authTitle">{{ 'Create an account' if mode == 'register' else 'Log in' }}</h2>
+
+      {% if not accounts_enabled %}
+        <p class="message loss">Accounts are currently unavailable. You can still
+          <a href="{{ url_for('index') }}">play as a guest</a>.</p>
+      {% else %}
+      <label for="username">Username</label>
+      <input id="username" name="username" type="text" autocomplete="username"
+             autocapitalize="none" spellcheck="false" required />
+
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password"
+             autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" required />
+
+      <p class="hint" id="authHint">
+        {% if mode == 'register' %}
+          Username: 3&ndash;32 letters, digits, or underscores. Password: at least 8 characters.
+        {% else %}
+          Enter your username and password.
+        {% endif %}
+      </p>
+
+      <div class="message" id="authError" role="alert"></div>
+
+      <button type="submit" class="btn" id="authSubmit">
+        {{ 'Sign up' if mode == 'register' else 'Log in' }}
+      </button>
+
+      <p class="auth-switch">
+        {% if mode == 'register' %}
+          Already have an account? <a href="{{ url_for('login_page') }}">Log in</a>.
+        {% else %}
+          New here? <a href="{{ url_for('register_page') }}">Create an account</a>.
+        {% endif %}
+      </p>
+      <p class="auth-switch">Or just <a href="{{ url_for('index') }}">play as a guest</a>.</p>
+      {% endif %}
+    </form>
+  </main>
+
+  <script src="{{ url_for('static', filename='auth.js') }}"></script>
+</body>
+</html>

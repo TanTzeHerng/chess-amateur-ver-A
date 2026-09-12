@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ bot_name }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>Play vs <span class="bot-name">{{ bot_name }}</span></h1>
+    <nav class="account-nav" id="accountNav">
+      {% if user %}
+        <span class="who">Signed in as <strong>{{ user.username }}</strong></span>
+        <a class="navlink" href="{{ url_for('history_page') }}">My games</a>
+        <button id="logoutBtn" type="button" class="navlink btnlink">Log out</button>
+      {% elif accounts_enabled %}
+        <a class="navlink" href="{{ url_for('login_page') }}">Log in</a>
+        <a class="navlink" href="{{ url_for('register_page') }}">Sign up</a>
+        <span class="who">or playing as <strong>guest</strong></span>
+      {% else %}
+        <span class="who">Guest mode (accounts unavailable)</span>
+      {% endif %}
+    </nav>
+  </header>
+
+  <main class="layout">
+    <section class="board-area">
+      <div class="opponent-strip" id="opponentStrip">
+        <span class="opponent-label">Opponent: <span class="bot-name">{{ bot_name }}</span> <span class="threads-badge" id="threadsBadge"></span></span>
+        <span class="thinking" id="thinking" hidden>{{ bot_name }} is thinking&hellip;</span>
+      </div>
+
+      <div class="board-wrap">
+        <div id="board" class="board" role="grid" aria-label="Chess board"></div>
+      </div>
+
+      <div class="banner" id="banner" hidden></div>
+    </section>
+
+    <aside class="panel">
+      <div class="controls">
+        <fieldset class="color-choice">
+          <legend>Play as</legend>
+          <label><input type="radio" name="color" value="white" checked /> White</label>
+          <label><input type="radio" name="color" value="black" /> Black</label>
+        </fieldset>
+        <div class="threads-choice">
+          <label for="threads">Engine threads</label>
+          <input type="number" id="threads" name="threads" value="{{ default_threads }}" min="1" max="128" step="1" />
+          <p class="hint">Lower this on small servers (1&ndash;2).</p>
+        </div>
+        <button id="newGame" type="button" class="btn">New Game</button>
+        <button id="resignBtn" type="button" class="btn btn-danger" hidden>Resign</button>
+      </div>
+
+      <div class="status-block">
+        <div class="turn-indicator" id="turnIndicator">Loading&hellip;</div>
+        <div class="message" id="message" role="status" aria-live="polite"></div>
+      </div>
+
+      <div class="movelog-block">
+        <h2>Move log</h2>
+        <ol class="movelog" id="moveLog"></ol>
+      </div>
+    </aside>
+  </main>
+
+  <!-- Promotion picker overlay -->
+  <div id="promoOverlay" class="promo-overlay" hidden>
+    <div class="promo-box">
+      <p>Promote to:</p>
+      <div class="promo-choices" id="promoChoices"></div>
+    </div>
+  </div>
+
+  <!-- Flags for the frontend: whether a user is signed in (enables save/
+       resume/resign + the one-active-game rule) and whether accounts exist. -->
+  <script>
+    window.CHESS_AMATEUR = {
+      botName: {{ bot_name | tojson }},
+      loggedIn: {{ 'true' if user else 'false' }},
+      accountsEnabled: {{ 'true' if accounts_enabled else 'false' }},
+      defaultThreads: {{ default_threads | tojson }}
+    };
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

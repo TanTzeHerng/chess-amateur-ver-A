@@ -98,19 +98,55 @@ like `SF_THREADS=2` — spawning 128 threads there is wasteful and slow to start
 > **Note:** The very first engine call can take a little while because Stockfish
 > spawns 128 threads on startup. This is expected.
 
+## Stateless design (works across restarts / multiple workers)
+
+The game history is **held by the client and sent with every move**, and the
+server rebuilds the position from it. The server does **not** rely on its own
+memory to serve a move.
+
+This matters on cloud hosts. On a platform like Render (free tier), the process
+that handled `POST /api/new` is **not** guaranteed to be the one that later
+handles `POST /api/move`: the platform may run multiple workers and freely
+restart, recycle, or cold-start the instance between requests. If the game were
+kept only in an in-memory dict keyed by `game_id`, the later request would hit a
+process whose memory is empty and get an HTTP `404 "unknown game_id"` — which is
+exactly the "Server error (404)." a player saw right after their first move.
+
+The fix makes moves **stateless**: `POST /api/move` carries the authoritative
+list of UCI moves played so far (`moves`), plus `human_color` and `threads`. The
+server replays that list onto a fresh `chess.Board` (python-chess remains the
+single source of truth for legality, SAN, FEN, and game-over detection),
+validates the new move, applies it, gets Chess Amateur's reply, and returns the
+full updated state — including the new authoritative `moves` list that the client
+then echoes back on the next move. A `game_id` is still issued for display, and
+an in-memory `GAMES` dict is kept as a **best-effort, non-authoritative cache**,
+but correctness never depends on it. So the game survives restarts and works no
+matter which worker serves each request.
+
 ## HTTP API
 
 The frontend talks to a tiny JSON API (also usable directly with `curl`):
 
 - `POST /api/new` — body `{"human_color": "white" | "black", "threads": 1..128?}`.
-  Starts a new game and returns the game state (including a `game_id` and the
-  active `threads` count). `threads` is optional; omit it to use the server
+  Starts a new game and returns the game state, including a `game_id`, the active
+  `threads` count, and `moves` (the starting UCI history: `[]`, or one engine
+  move if you chose Black). `threads` is optional; omit it to use the server
   default (`SF_THREADS`, else 128).
-- `POST /api/move` — body `{"game_id": "...", "move": "e2e4"}`. Applies your move
-  (UCI notation), then returns Chess Amateur's reply and the updated state.
-  Illegal moves return HTTP 400 with `{"error": "illegal move"}` and leave the
-  board unchanged.
-- `GET /api/state?game_id=...` — returns the current state of a game.
+- `POST /api/move` — body
+  `{"moves": ["e2e4", ...], "move": "e7e5", "human_color": "white" | "black", "threads": 1..128?, "game_id": "..."?}`.
+  `moves` is the authoritative history so far (what the previous response
+  returned); `move` is the new human move in UCI notation (promotions look like
+  `e7e8q`). The server rebuilds the position from `moves`, applies your move,
+  then returns Chess Amateur's reply and the updated state (new `fen`,
+  `san_history`, `legal_moves`, `last_bot_move`, `moves`, `game_over` / `result`
+  / `result_reason`, etc.). `game_id` is optional and display-only.
+  - Illegal moves return HTTP 400 with `{"error": "illegal move"}` and leave the
+    carried state unchanged (the client re-sends the same history for its next
+    attempt — no desync).
+  - A move history that cannot be legally replayed returns HTTP 400 with
+    `{"error": "invalid move history"}`.
+- `GET /api/state?game_id=...` — best-effort snapshot from the in-memory cache
+  (may be absent after a restart; not a correctness dependency).
 - `GET /` — serves the frontend (`static/index.html`).
 
 ## Running the tests
@@ -137,9 +173,20 @@ separate server needs to be running.
 
 ## Deploying with Docker
 
-The repo ships a `Dockerfile` that bundles a Stockfish binary (linux/amd64)
-inside the image, so the container runs anywhere without an external engine
-install. It uses a slim Python base and installs only `python-chess`.
+The repo ships a `Dockerfile` that downloads an official Stockfish release
+(linux/amd64) at build time and places it inside the image, so the container
+runs anywhere without a separate engine install. It uses a slim Python base and
+installs only `python-chess`.
+
+The Dockerfile deliberately uses the **generic** `stockfish-ubuntu-x86-64`
+build rather than a CPU-optimized variant (AVX2/BMI2). The optimized builds use
+instructions that some cloud CPUs lack; on such a host the binary dies instantly
+with `SIGILL` on launch, the engine never starts, and a move request hangs until
+the platform proxy returns a `502` with nothing in the logs. The generic build
+runs on any 64-bit x86 CPU. Because Chess Amateur searches at depth 1, the
+CPU-optimization level does not affect move quality, so the generic build costs
+nothing. A strict build-time smoke test runs a real UCI handshake and fails the
+build if the binary cannot execute, so a broken engine is never shipped.
 
 Build and run locally:
 
@@ -166,13 +213,17 @@ which you can then open on your phone. Any of the common container hosts work
 builds from a `Dockerfile`). Point it at this directory, let it build the image,
 set `SF_THREADS` low if the host is small, and open the URL it gives you.
 
-> **Note:** the image bundles the ~103&nbsp;MB Stockfish binary, so the build
-> context and image are correspondingly large. `.dockerignore` trims caches and
-> tests from the context.
+> **Note:** the image contains a Stockfish binary (~50&nbsp;MB), downloaded
+> during the build rather than committed to the repo, so the build context
+> stays small. `.dockerignore` trims caches and tests from the context.
 
 ## Notes
 
 - All move legality is enforced **server-side** via python-chess; the browser is
-  never trusted to decide what is legal.
+  never trusted to decide what is legal. It supplies only the raw move history,
+  which the server validates by replaying it move by move.
+- Game state is **client-carried and stateless on the server** (see the
+  "Stateless design" section), so the app works correctly on hosts that run
+  multiple workers or restart the process between requests.
 - A single Stockfish process is reused across moves and is shut down cleanly when
   the server stops.

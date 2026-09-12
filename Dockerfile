@@ -45,23 +45,32 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Application code.
-COPY server.py engine.py ./
+# Application code. The Flask app (app.py) is the entry point; it reuses the
+# engine (engine.py) and the stateless chess core (chess_core.py), and adds
+# accounts/history (auth.py, storage.py). Templates + static assets included.
+COPY server.py engine.py chess_core.py auth.py storage.py app.py ./
 COPY static/ ./static/
+COPY templates/ ./templates/
 
 # Point the app at the downloaded engine and default to 128 threads.
-# On small hosts (e.g. Render free/starter) override with SF_THREADS=2.
+# Override with SF_THREADS on small hosts if memory is tight.
 # PYTHONUNBUFFERED=1 forces Python's stdout/stderr to be unbuffered so the
-# app's startup + per-request logs actually reach the platform log collector
-# (otherwise block-buffering in a container hides all application logs).
+# app's startup + per-request logs (incl. operator UCI telemetry) actually
+# reach the platform log collector (block-buffering otherwise hides them).
+#   DATABASE_URL : Postgres connection string. If UNSET, the app runs in
+#                  GUEST-ONLY mode (play works; accounts/history disabled).
+#   SECRET_KEY   : Flask session signing key (set this in production so logins
+#                  persist across restarts).
 ENV STOCKFISH_PATH=/usr/local/bin/stockfish \
     PORT=8000 \
     SF_THREADS=128 \
     PYTHONUNBUFFERED=1
 
-# Hosting platforms typically inject their own PORT; the server honors it and
-# binds 0.0.0.0. 8000 is the local default.
+# Hosting platforms typically inject their own PORT; honored below. Bind 0.0.0.0.
 EXPOSE 8000
 
-# -u also forces unbuffered stdio, belt-and-suspenders with PYTHONUNBUFFERED.
-CMD ["python3", "-u", "server.py"]
+# Run Flask via gunicorn. ONE worker preserves the single-Stockfish-process
+# memory model (the whole app shares one engine instance); --threads lets that
+# one worker handle concurrent HTTP requests. The engine's own lock serializes
+# actual searches. `sh -c` so ${PORT} is expanded at runtime (Render injects it).
+CMD ["sh", "-c", "gunicorn --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:${PORT} app:app"]
