@@ -493,6 +493,10 @@ def api_move():
     extra = _move_extra(user, mode, base_seconds, increment, started_at, clock,
                         in_progress=bool(user) and not game_over,
                         game_over=game_over, rating_delta=rating_delta)
+    # Tell the client how long Chess Amateur "thought" so it can HOLD the bot's
+    # move for that real duration before revealing it (FIDE-mode human pacing).
+    # Only meaningful in FIDE mode with a clock; 0 otherwise (instant).
+    extra["bot_think"] = bot_think if (mode == "fide" and not unlimited) else 0.0
     return jsonify(core.state_dict(board, human_color, threads, san_history,
                                    moves_uci, game_id=gid,
                                    last_bot_move=last_bot_move, extra=extra))

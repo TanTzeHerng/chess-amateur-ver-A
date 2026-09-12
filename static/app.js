@@ -474,54 +474,130 @@ async function sendMove(uci, fromSq, toSq) {
       if (!res.ok) { showMessage("Server error (" + res.status + ")."); return; }
       const next = await res.json();
       const botUci = next.last_bot_move ? next.last_bot_move.uci : null;
-      if (CASettings.animations && botUci) {
-        // Human piece already slid (before the POST). To animate the BOT's
-        // reply, first show the INTERMEDIATE position (human move applied, bot
-        // move NOT yet applied) so the bot's piece is still on its origin
-        // square; only then can it slide. We fetch that position's FEN from the
-        // read-only /api/view endpoint using the move list minus the bot ply.
-        const interMoves = next.moves.slice(0, next.moves.length - 1);
-        let interFen = null;
-        try {
-          const vr = await fetch("/api/view", {
-            method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ moves: interMoves, human_color: humanColor }),
-          });
-          if (vr.ok) interFen = (await vr.json()).fen;
-        } catch (e) { /* fall through to no-slide */ }
 
-        if (CASettings.sound) CASound.move();    // knock for the human move
-        if (interFen) {
-          // Render the intermediate position, then slide the bot piece.
-          state = Object.assign({}, next, { fen: interFen, last_bot_move: null });
-          renderBoard();
-          animateSlide(botUci.slice(0, 2), botUci.slice(2, 4), () => {
-            adoptState(next);            // commit final position
-            renderAll();
-            playBotResolutionSound(next);
-            afterMoveResolved();         // fairness: resume human clock now
-          });
+      // BUG-FIX 1 (sound ordering): play the HUMAN's move sound NOW, the moment
+      // his move resolves on the server -- not later, buried in the bot's
+      // animation path. Human's own move (check knock if it gave check, else a
+      // normal knock). If the human's move ended the game, play the end tune.
+      playHumanMoveSound(next, botUci);
+
+      // BUG-FIX 2 (instant bot move): in FIDE mode Chess Amateur must actually
+      // WAIT its computed think-time before revealing its move, with its clock
+      // ticking down live (the human's clock stays stopped -- fairness). Only
+      // after the pause do we reveal/animate the reply.
+      const botThink = (typeof next.bot_think === "number") ? next.bot_think : 0;
+
+      const revealBot = () => {
+        if (!botUci) {
+          // No bot reply (human move ended the game): just commit + resume.
+          adoptState(next);
+          renderAll();
+          afterMoveResolved();
+          setBusy(false);
+          return;
+        }
+        if (CASettings.animations) {
+          // Show the INTERMEDIATE position (human moved, bot not yet) so the
+          // bot's piece is on its origin square, then slide it.
+          revealBotAnimated(next, botUci);
         } else {
-          // Couldn't get the intermediate position: just show the result.
           adoptState(next);
           renderAll();
           playBotResolutionSound(next);
           afterMoveResolved();
+          setBusy(false);
         }
+      };
+
+      if (botUci && botThink > 0) {
+        holdForBotThink(next, botThink, revealBot);   // ticks bot clock, then reveals
       } else {
-        // No animation (or no bot reply): render final state and play a single
-        // sound event for the resolved position.
-        adoptState(next);
-        renderAll();
-        playMoveSounds(null, next);
-        afterMoveResolved();
+        revealBot();
       }
     } catch (e) {
       showMessage("Network error. Please try again.");
-    } finally { setBusy(false); }
+      setBusy(false);
+    }
   };
   if (CASettings.animations) animateSlide(fromSq, toSq, doPost);
   else doPost();
+}
+
+// Sound for the HUMAN's own move, played immediately when it resolves.
+// san_history layout after a move: [..., humanSan] or [..., humanSan, botSan].
+// If there is a bot reply (botUci set), the human's SAN is the second-to-last;
+// otherwise (human move ended the game) it's the last entry.
+function playHumanMoveSound(next, botUci) {
+  if (!CASettings.sound) return;
+  const h = next.san_history || [];
+  const humanSan = botUci ? h[h.length - 2] : h[h.length - 1];
+  const humanGaveCheckOrMate = humanSan && (humanSan.includes("+") || humanSan.includes("#"));
+  // If the human's move ended the game, play the end tune for the human's move.
+  if (next.game_over && !botUci) {
+    const info = bannerInfo(next.result, next.result_reason, humanColor);
+    if (humanGaveCheckOrMate) CASound.check(); else CASound.move();
+    setTimeout(() => {
+      if (info.kind === "win") CASound.win();
+      else if (info.kind === "draw") CASound.draw();
+      else CASound.loss();
+    }, 180);
+  } else {
+    if (humanGaveCheckOrMate) CASound.check(); else CASound.move();
+  }
+}
+
+// Hold Chess Amateur's move for `seconds` (its real think-time), ticking its
+// clock down live while the human's clock stays stopped (fairness). Calls
+// `done()` once the pause elapses. A "thinking" indicator is shown throughout.
+function holdForBotThink(next, seconds, done) {
+  const botColor = humanColor === "white" ? "black" : "white";
+  const startClock = (next.clock && next.clock[botColor] != null)
+    ? next.clock[botColor] + seconds   // clock in `next` already has think-time deducted;
+    : null;                            // add it back so we can animate it counting down
+  const t0 = performance.now();
+  thinkingEl.hidden = false;
+  const tick = setInterval(() => {
+    const elapsed = (performance.now() - t0) / 1000;
+    if (clockState && startClock != null) {
+      clockState[botColor] = Math.max(next.clock[botColor], startClock - elapsed);
+      renderClocks();
+    }
+    if (elapsed >= seconds) {
+      clearInterval(tick);
+      thinkingEl.hidden = true;
+      done();
+    }
+  }, 100);
+}
+
+// Reveal the bot's move with the slide animation (intermediate position first).
+function revealBotAnimated(next, botUci) {
+  const interMoves = next.moves.slice(0, next.moves.length - 1);
+  const finish = (interFen) => {
+    if (interFen) {
+      state = Object.assign({}, next, { fen: interFen, last_bot_move: null });
+      renderBoard();
+      animateSlide(botUci.slice(0, 2), botUci.slice(2, 4), () => {
+        adoptState(next);
+        renderAll();
+        playBotResolutionSound(next);
+        afterMoveResolved();
+        setBusy(false);
+      });
+    } else {
+      adoptState(next);
+      renderAll();
+      playBotResolutionSound(next);
+      afterMoveResolved();
+      setBusy(false);
+    }
+  };
+  fetch("/api/view", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ moves: interMoves, human_color: humanColor }),
+  }).then(r => r.ok ? r.json() : null)
+    .then(d => finish(d ? d.fen : null))
+    .catch(() => finish(null));
 }
 
 // CASound after the bot's move resolves (check knock or end tune).
