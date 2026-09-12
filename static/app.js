@@ -6,8 +6,13 @@
 
 const CFG = window.CHESS_AMATEUR || { botName: "Chess Amateur", loggedIn: false, accountsEnabled: false, defaultThreads: 128 };
 const BOT_NAME = CFG.botName;
-const Settings = window.CA_Settings;
-const Sound = window.CA_Sound;
+// NOTE: effects.js declares top-level `const CASettings`/`const CASound` and also
+// exposes them as window.CA_Settings/CA_Sound. Because both files load into the
+// same global scope, we must NOT redeclare `CASettings`/`CASound` here (that throws
+// "Identifier 'CASettings' has already been declared" and stops app.js). Use
+// distinct local names bound to the globals instead.
+const CASettings = window.CA_Settings;
+const CASound = window.CA_Sound;
 
 const GLYPHS = {
   K: "\u2654", Q: "\u2655", R: "\u2656", B: "\u2657", N: "\u2658", P: "\u2659",
@@ -210,7 +215,7 @@ function centerOf(square) {
 // Animate the piece currently on `from` sliding to `to`, then run cb().
 // If animations are off (or the squares can't be found), cb() runs immediately.
 function animateSlide(from, to, cb) {
-  if (!Settings.animations) { cb(); return; }
+  if (!CASettings.animations) { cb(); return; }
   const fromSq = boardEl.querySelector('[data-square="' + from + '"]');
   const pieceEl = fromSq && fromSq.querySelector(".piece");
   const a = centerOf(from), b = centerOf(to);
@@ -298,18 +303,18 @@ function lastSanIndicatesCheck(s) {
 
 // Play the sound appropriate to the new state after a move resolves.
 function playMoveSounds(prev, next) {
-  if (!Settings.sound) return;
+  if (!CASettings.sound) return;
   if (next.game_over) {
     // Move knock first (the move that ended it), then the end tune.
     const info = bannerInfo(next.result, next.result_reason, humanColor);
-    if (lastSanIndicatesCheck(next)) Sound.check(); else Sound.move();
+    if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
     setTimeout(() => {
-      if (info.kind === "win") Sound.win();
-      else if (info.kind === "draw") Sound.draw();
-      else Sound.loss();
+      if (info.kind === "win") CASound.win();
+      else if (info.kind === "draw") CASound.draw();
+      else CASound.loss();
     }, 180);
   } else {
-    if (lastSanIndicatesCheck(next)) Sound.check(); else Sound.move();
+    if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
   }
 }
 
@@ -331,13 +336,13 @@ async function sendMove(uci, fromSq, toSq) {
       const next = await res.json();
       const botUci = next.last_bot_move ? next.last_bot_move.uci : null;
       adoptState(next);
-      if (Settings.animations && botUci) {
+      if (CASettings.animations && botUci) {
         // Human piece already slid (before the POST). Render the post-human
         // position, knock for the human move, then slide the bot's piece and
         // play the bot's resolution sound (check knock / normal knock / end
         // tune) after its slide. Animations stagger the two knocks in time.
         renderAll();
-        if (Settings.sound) Sound.move();
+        if (CASettings.sound) CASound.move();
         animateSlide(botUci.slice(0, 2), botUci.slice(2, 4), () => {
           renderAll();
           playBotResolutionSound(next);
@@ -352,23 +357,23 @@ async function sendMove(uci, fromSq, toSq) {
       showMessage("Network error. Please try again.");
     } finally { setBusy(false); }
   };
-  if (Settings.animations) animateSlide(fromSq, toSq, doPost);
+  if (CASettings.animations) animateSlide(fromSq, toSq, doPost);
   else doPost();
 }
 
-// Sound after the bot's move resolves (check knock or end tune).
+// CASound after the bot's move resolves (check knock or end tune).
 function playBotResolutionSound(next) {
-  if (!Settings.sound) return;
+  if (!CASettings.sound) return;
   if (next.game_over) {
     const info = bannerInfo(next.result, next.result_reason, humanColor);
-    if (lastSanIndicatesCheck(next)) Sound.check(); else Sound.move();
+    if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
     setTimeout(() => {
-      if (info.kind === "win") Sound.win();
-      else if (info.kind === "draw") Sound.draw();
-      else Sound.loss();
+      if (info.kind === "win") CASound.win();
+      else if (info.kind === "draw") CASound.draw();
+      else CASound.loss();
     }, 180);
   } else {
-    if (lastSanIndicatesCheck(next)) Sound.check(); else Sound.move();
+    if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
   }
 }
 
@@ -402,7 +407,7 @@ async function newGame() {
     adoptState(await res.json());
     renderAll();
     // If bot (white) opened, knock for it.
-    if (state.last_bot_move && Settings.sound) Sound.move();
+    if (state.last_bot_move && CASettings.sound) CASound.move();
   } catch (e) {
     showMessage("Network error starting game.");
   } finally { setBusy(false); }
@@ -423,7 +428,7 @@ async function resign() {
       state.legal_moves = [];
     }
     renderAll();
-    if (Settings.sound) Sound.loss();
+    if (CASettings.sound) CASound.loss();
     showMessage("You resigned. See it in \u201CMy games\u201D.");
   } catch (e) {
     showMessage("Network error resigning.");
@@ -528,27 +533,27 @@ function stopAutoplay() {
 function toggleAutoplay() { replayTimer ? stopAutoplay() : startAutoplay(); updateReplayControls(); }
 
 // =========================================================================
-// Settings toggles (with the sound-needs-animations dependency)
+// CASettings toggles (with the sound-needs-animations dependency)
 // =========================================================================
 function syncToggleUI() {
-  animToggle.checked = Settings.animations;
-  soundToggle.checked = Settings.sound;
-  // Sound toggle is disabled + greyed when animations are off.
-  soundToggle.disabled = !Settings.animations;
-  soundNote.hidden = Settings.animations;
+  animToggle.checked = CASettings.animations;
+  soundToggle.checked = CASettings.sound;
+  // CASound toggle is disabled + greyed when animations are off.
+  soundToggle.disabled = !CASettings.animations;
+  soundNote.hidden = CASettings.animations;
 }
 function wireSettings() {
   syncToggleUI();
   animToggle.addEventListener("change", () => {
-    Settings.setAnimations(animToggle.checked);
+    CASettings.setAnimations(animToggle.checked);
     syncToggleUI();
   });
   soundToggle.addEventListener("change", () => {
-    Settings.setSound(soundToggle.checked);
+    CASettings.setSound(soundToggle.checked);
     syncToggleUI();
     // A tiny knock confirms sound is on (and satisfies the user-gesture
     // requirement to unlock audio).
-    if (Settings.sound) Sound.move();
+    if (CASettings.sound) CASound.move();
   });
 }
 
