@@ -22,6 +22,11 @@
 
 * { box-sizing: border-box; }
 
+/* The HTML [hidden] attribute must always win over any display: rule below
+   (e.g. .btn sets display:inline-block, .promo-overlay sets display:flex).
+   Without this, elements marked hidden in the template still show. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   background: var(--black);
@@ -168,6 +173,9 @@ input[type="number"] {
 .banner.draw { color: var(--yellow);  border-color: var(--yellow); }
 
 /* ---- promotion overlay ---- */
+/* The [hidden] attribute must win over display:flex, otherwise the overlay is
+   always shown (covering the whole app on load). Hide it explicitly. */
+.promo-overlay[hidden] { display: none !important; }
 .promo-overlay {
   position: fixed; inset: 0; background: var(--black);
   display: flex; align-items: center; justify-content: center; z-index: 50;
