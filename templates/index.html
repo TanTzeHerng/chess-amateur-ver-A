@@ -59,6 +59,32 @@
         <div class="message" id="message" role="status" aria-live="polite"></div>
       </div>
 
+      <!-- Replay controls: shown only when replaying a finished game. -->
+      <div class="replay-block" id="replayBlock">
+        <h2>Replay</h2>
+        <div class="replay-controls">
+          <button id="replayFirst" type="button" title="First position">&#x23EE;</button>
+          <button id="replayPrev"  type="button" title="Back one move">&#x25C0;</button>
+          <button id="replayPlay"  type="button" title="Play / pause">&#x23EF;</button>
+          <button id="replayNext"  type="button" title="Next move">&#x25B6;</button>
+          <button id="replayLast"  type="button" title="Last position">&#x23ED;</button>
+        </div>
+        <div class="replay-status" id="replayStatus"></div>
+      </div>
+
+      <div class="settings-block">
+        <h2>Settings</h2>
+        <div class="toggle-row">
+          <label for="animToggle">Animations</label>
+          <input type="checkbox" id="animToggle" />
+        </div>
+        <div class="toggle-row">
+          <label for="soundToggle">Sound effects</label>
+          <input type="checkbox" id="soundToggle" />
+        </div>
+        <p class="disabled-note" id="soundNote" hidden>Sound needs animations on.</p>
+      </div>
+
       <div class="movelog-block">
         <h2>Move log</h2>
         <ol class="movelog" id="moveLog"></ol>
@@ -84,6 +110,7 @@
       defaultThreads: {{ default_threads | tojson }}
     };
   </script>
+  <script src="{{ url_for('static', filename='effects.js') }}"></script>
   <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>

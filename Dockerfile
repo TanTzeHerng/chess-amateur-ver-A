@@ -48,7 +48,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code. The Flask app (app.py) is the entry point; it reuses the
 # engine (engine.py) and the stateless chess core (chess_core.py), and adds
 # accounts/history (auth.py, storage.py). Templates + static assets included.
-COPY server.py engine.py chess_core.py auth.py storage.py app.py ./
+COPY engine.py chess_core.py auth.py storage.py app.py ./
 COPY static/ ./static/
 COPY templates/ ./templates/
 
