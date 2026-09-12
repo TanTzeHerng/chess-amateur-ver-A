@@ -335,21 +335,42 @@ async function sendMove(uci, fromSq, toSq) {
       if (!res.ok) { showMessage("Server error (" + res.status + ")."); return; }
       const next = await res.json();
       const botUci = next.last_bot_move ? next.last_bot_move.uci : null;
-      adoptState(next);
       if (CASettings.animations && botUci) {
-        // Human piece already slid (before the POST). Render the post-human
-        // position, knock for the human move, then slide the bot's piece and
-        // play the bot's resolution sound (check knock / normal knock / end
-        // tune) after its slide. Animations stagger the two knocks in time.
-        renderAll();
-        if (CASettings.sound) CASound.move();
-        animateSlide(botUci.slice(0, 2), botUci.slice(2, 4), () => {
+        // Human piece already slid (before the POST). To animate the BOT's
+        // reply, first show the INTERMEDIATE position (human move applied, bot
+        // move NOT yet applied) so the bot's piece is still on its origin
+        // square; only then can it slide. We fetch that position's FEN from the
+        // read-only /api/view endpoint using the move list minus the bot ply.
+        const interMoves = next.moves.slice(0, next.moves.length - 1);
+        let interFen = null;
+        try {
+          const vr = await fetch("/api/view", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ moves: interMoves, human_color: humanColor }),
+          });
+          if (vr.ok) interFen = (await vr.json()).fen;
+        } catch (e) { /* fall through to no-slide */ }
+
+        if (CASettings.sound) CASound.move();    // knock for the human move
+        if (interFen) {
+          // Render the intermediate position, then slide the bot piece.
+          state = Object.assign({}, next, { fen: interFen, last_bot_move: null });
+          renderBoard();
+          animateSlide(botUci.slice(0, 2), botUci.slice(2, 4), () => {
+            adoptState(next);            // commit final position
+            renderAll();
+            playBotResolutionSound(next);
+          });
+        } else {
+          // Couldn't get the intermediate position: just show the result.
+          adoptState(next);
           renderAll();
           playBotResolutionSound(next);
-        });
+        }
       } else {
         // No animation (or no bot reply): render final state and play a single
         // sound event for the resolved position.
+        adoptState(next);
         renderAll();
         playMoveSounds(null, next);
       }
@@ -488,15 +509,27 @@ async function startReplay(gameId) {
   } catch (e) { showMessage("Network error loading game."); }
 }
 
+let replayReqSeq = 0;   // guards against out-of-order /api/view responses
 async function renderReplayPosition() {
-  // Render the position after the first `replayIndex` plies.
-  const partial = replayMoves.slice(0, replayIndex);
-  const res = await fetch("/api/view", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ moves: partial, human_color: humanColor }),
-  });
+  // Render the position after the first `replayIndex` plies. Guard against
+  // races: during 1s autoplay, multiple /api/view fetches may be in flight;
+  // only the most recent request is allowed to update the board so a slow
+  // earlier response can't clobber a newer position (which looked like the
+  // board "sticking" on an early move).
+  const myReq = ++replayReqSeq;
+  const idxAtRequest = replayIndex;
+  const partial = replayMoves.slice(0, idxAtRequest);
+  let res;
+  try {
+    res = await fetch("/api/view", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ moves: partial, human_color: humanColor }),
+    });
+  } catch (e) { return; }
   if (!res.ok) return;
-  state = await res.json();
+  const data = await res.json();
+  if (myReq !== replayReqSeq) return;   // a newer request superseded this one
+  state = data;
   replayMode = true;
   renderAll();
   updateReplayControls();
