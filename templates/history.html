@@ -10,8 +10,7 @@
   <header class="topbar">
     <h1><span class="bot-name">{{ bot_name }}</span> &middot; My games</h1>
     <nav class="account-nav">
-      <span class="who">Signed in as <strong>{{ user.username }}</strong></span>
-      <a class="navlink" href="{{ url_for('index') }}">&larr; Board</a>
+      <a class="navlink" href="{{ url_for('index') }}">Home</a>
       <button id="logoutBtn" type="button" class="navlink btnlink">Log out</button>
     </nav>
   </header>
@@ -20,54 +19,113 @@
     {% if not games %}
       <p class="empty">No games yet. <a href="{{ url_for('index') }}">Play one!</a></p>
     {% else %}
+
+    <!-- Sort + filter controls. All driven client-side by history.js over the
+         embedded games JSON (below). Filter panels default hidden via the
+         [hidden] attribute (the global rule governs show/hide). -->
+    <div class="history-toolbar">
+      <div class="sort-control">
+        <label for="sortSelect">Sort</label>
+        <select id="sortSelect">
+          <option value="default" selected>Default</option>
+          <option value="start">Start Time</option>
+          <option value="end">End Time</option>
+        </select>
+      </div>
+
+      <div class="disclosure filter-disclosure" id="filterTab">
+        <button type="button" class="disclosure-toggle" id="filterToggle" aria-expanded="false">
+          Filters <span class="arrow">&#x25B8;</span>
+        </button>
+        <div class="disclosure-body filter-body" id="filterBody" hidden>
+
+          <!-- RESULT (multi-select win/draw/loss, relative to the human) with a
+               reason sub-filter over the canonical reason categories. -->
+          <fieldset class="filter-group">
+            <legend>Result</legend>
+            <label><input type="checkbox" class="f-result" value="win" /> Win</label>
+            <label><input type="checkbox" class="f-result" value="draw" /> Draw</label>
+            <label><input type="checkbox" class="f-result" value="loss" /> Loss</label>
+            <div class="filter-sub">
+              <span class="sub-label">Reason</span>
+              <label><input type="checkbox" class="f-reason" value="checkmate" /> checkmate</label>
+              <label><input type="checkbox" class="f-reason" value="resignation" /> resignation</label>
+              <label><input type="checkbox" class="f-reason" value="on time" /> on time</label>
+              <label><input type="checkbox" class="f-reason" value="3-fold repetition" /> 3-fold repetition</label>
+              <label><input type="checkbox" class="f-reason" value="stalemate" /> stalemate</label>
+              <label><input type="checkbox" class="f-reason" value="insufficient material" /> insufficient material</label>
+              <label><input type="checkbox" class="f-reason" value="50-move rule" /> 50-move rule</label>
+            </div>
+          </fieldset>
+
+          <!-- DATE RANGE on the START date. -->
+          <fieldset class="filter-group">
+            <legend>Date range (start)</legend>
+            <label>From <input type="date" id="fDateFrom" /></label>
+            <label>To <input type="date" id="fDateTo" /></label>
+          </fieldset>
+
+          <!-- TIME CONTROL: exactly blitz/rapid/classical/unlimited/custom.
+               NO bullet. 'custom' = any explicitly time-limited control. -->
+          <fieldset class="filter-group">
+            <legend>Time control</legend>
+            <label><input type="checkbox" class="f-tc" value="blitz" /> blitz</label>
+            <label><input type="checkbox" class="f-tc" value="rapid" /> rapid</label>
+            <label><input type="checkbox" class="f-tc" value="classical" /> classical</label>
+            <label><input type="checkbox" class="f-tc" value="unlimited" /> unlimited</label>
+            <label><input type="checkbox" class="f-tc" value="custom" /> custom</label>
+          </fieldset>
+
+          <!-- COLOR (the human's color). -->
+          <fieldset class="filter-group">
+            <legend>Color</legend>
+            <label><input type="checkbox" class="f-color" value="white" /> White</label>
+            <label><input type="checkbox" class="f-color" value="black" /> Black</label>
+          </fieldset>
+
+          <!-- MODE (fide/rated/casual). -->
+          <fieldset class="filter-group">
+            <legend>Mode</legend>
+            <label><input type="checkbox" class="f-mode" value="fide" /> FIDE-rated</label>
+            <label><input type="checkbox" class="f-mode" value="rated" /> Rated</label>
+            <label><input type="checkbox" class="f-mode" value="casual" /> Casual</label>
+          </fieldset>
+
+          <!-- ECO CODE (substring/prefix match on the classified code). -->
+          <fieldset class="filter-group">
+            <legend>ECO code</legend>
+            <label>Code <input type="text" id="fEco" placeholder="e.g. C60" size="8" /></label>
+          </fieldset>
+
+          <button type="button" class="btn btn-small" id="filterClear">Clear filters</button>
+        </div>
+      </div>
+    </div>
+
     <table class="history-table">
       <thead>
         <tr>
-          <th>Started</th><th>Ended</th><th>You played</th>
-          <th>Status</th><th>Result</th><th></th>
+          <th>Date</th><th>Result</th><th></th>
         </tr>
       </thead>
-      <tbody>
-        {% for g in games %}
-        <tr>
-          <td class="mono">{{ g.started_at }}</td>
-          <td class="mono">{{ g.ended_at if g.ended_at else '—' }}</td>
-          <td>{{ g.human_color | capitalize }}</td>
-          <td>
-            {% if g.status == 'in_progress' %}
-              <span class="tag tag-live">In progress</span>
-            {% else %}
-              <span class="tag">Finished</span>
-            {% endif %}
-          </td>
-          <td>
-            {% if g.status == 'in_progress' %}
-              &mdash;
-            {% else %}
-              {% set human_white = (g.human_color == 'white') %}
-              {% if g.result == '1/2-1/2' %}
-                Draw ({{ g.result_reason }})
-              {% elif (g.result == '1-0' and human_white) or (g.result == '0-1' and not human_white) %}
-                Win ({{ g.result_reason }})
-              {% else %}
-                Loss ({{ g.result_reason }})
-              {% endif %}
-            {% endif %}
-          </td>
-          <td>
-            {% if g.status == 'in_progress' %}
-              <a class="btn btn-small" href="{{ url_for('index') }}">Resume</a>
-            {% else %}
-              <a class="btn btn-small" href="{{ url_for('index') }}?replay={{ g.id }}">Replay</a>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
+      <tbody id="historyBody">
+        <!-- Rows are rendered client-side by history.js from HISTORY_GAMES. -->
       </tbody>
     </table>
+    <p class="empty" id="noMatch" hidden>No games match these filters.</p>
     {% endif %}
   </main>
 
+  <!-- Embed the games list as JSON so history.js can filter/sort without an
+       extra request (mirrors how index.html embeds CHESS_AMATEUR). Each game
+       carries: id, started_at, ended_at (or null), result, result_reason (raw
+       code), human_color, base_seconds, increment, mode, eco_code, eco_name,
+       status, date. -->
+  <script>
+    window.HISTORY_GAMES = {{ games | tojson }};
+    window.HISTORY_INDEX_URL = {{ url_for('index') | tojson }};
+  </script>
   <script src="{{ url_for('static', filename='auth.js') }}"></script>
+  <script src="{{ url_for('static', filename='history.js') }}"></script>
 </body>
 </html>

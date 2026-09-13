@@ -163,6 +163,78 @@ def glicko2_update(rating, rd, vol, opp_rating, opp_rd, score, tau=GLICKO2_TAU):
 # Convenience: score from a game result relative to the human's color.
 # =========================================================================
 
+def display_ratings(user, mode, base_seconds, increment):
+    """Return the (player_rating, bot_rating) pair to show next to the names.
+
+    Depends on the game's MODE and TIME CLASS:
+      * FIDE  -> (player's FIDE rating for time_class(base,inc),
+                  CHESS_AMATEUR_FIDE[time_class])
+      * Rated -> (player's Glicko-2 rated_rating, CHESS_AMATEUR_RATED)
+      * Casual, or no account (guest) -> (None, None) meaning show no ratings.
+
+    `user` is a user dict (as from Store.get_user_by_id) or None for a guest.
+    Values are floats (frontend rounds for display); None means "hide".
+    """
+    if not user or mode == "casual":
+        return None, None
+    tclass = time_class(base_seconds, increment)
+    if mode == "fide":
+        player = {"blitz": user["fide_blitz"], "rapid": user["fide_rapid"],
+                  "classical": user["fide_classical"]}[tclass]
+        return float(player), float(CHESS_AMATEUR_FIDE[tclass])
+    if mode == "rated":
+        return float(user["rated_rating"]), float(CHESS_AMATEUR_RATED)
+    return None, None
+
+
+def format_delta(delta, suffix=None):
+    """Format a numeric rating delta as a signed display string.
+
+    A delta of exactly 0 renders as '+0' (per spec), NOT '+0.00'. Nonzero
+    deltas keep two decimals with an explicit sign, e.g. '+6.40' / '-3.21'.
+    `suffix` (e.g. 'FIDE classical') is appended when given.
+    """
+    if delta == 0:
+        text = "+0"
+    else:
+        sign = "+" if delta > 0 else ""
+        text = "%s%.2f" % (sign, delta)
+    if suffix:
+        text += " " + suffix
+    return text
+
+
+def time_control_bucket(base_seconds, increment):
+    """Map a time control to a My-Games FILTER bucket.
+
+    The filter offers EXACTLY five buckets (NO bullet):
+      * 'unlimited' when base_seconds is None (no clock).
+      * otherwise the class from time_class(base,inc): 'blitz'/'rapid'/'classical'.
+
+    Note: 'custom' is ALSO a selectable filter bucket but is NOT returned here.
+    The app only ever offers Custom or Unlimited time controls, so 'custom'
+    means "any explicitly time-limited control" -- i.e. every game whose
+    base_seconds is not None qualifies as 'custom' in addition to its
+    blitz/rapid/classical class. The UI treats 'custom' as an OR alongside the
+    derived class (a limited game matches both its class and 'custom'); this
+    helper returns only the single derived class so callers can decide.
+    """
+    if base_seconds is None:
+        return "unlimited"
+    return time_class(base_seconds, increment)
+
+
+def result_class(result, human_color):
+    """Classify a finished game's result RELATIVE TO THE HUMAN.
+
+    Returns 'win' / 'draw' / 'loss'. Used by the My Games result filter.
+    """
+    if result == "1/2-1/2":
+        return "draw"
+    score = human_score(result, human_color)
+    return "win" if score == 1.0 else "loss"
+
+
 def human_score(result, human_color):
     """Map a chess result string to the human's score (1/0.5/0).
 

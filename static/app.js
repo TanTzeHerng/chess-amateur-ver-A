@@ -1,16 +1,17 @@
 "use strict";
 
 // Chess Amateur frontend. Interactive board (Unicode glyphs), account-aware
-// play, replay of finished games with transport controls, plus animation and
-// synthesized-sound effects (see effects.js).
+// play, in-game review + finished-game review with transport controls, plus
+// animation and synthesized-sound effects (see effects.js).
 
-const CFG = window.CHESS_AMATEUR || { botName: "Chess Amateur", loggedIn: false, accountsEnabled: false, defaultThreads: 128 };
+const CFG = window.CHESS_AMATEUR || { botName: "Chess Amateur", loggedIn: false, accountsEnabled: false, defaultThreads: 128, username: "Guest" };
 const BOT_NAME = CFG.botName;
-// NOTE: effects.js declares top-level `const CASettings`/`const CASound` and also
+const HUMAN_NAME = CFG.username || "Guest";
+// NOTE: effects.js declares top-level `const Settings`/`const Sound` and also
 // exposes them as window.CA_Settings/CA_Sound. Because both files load into the
-// same global scope, we must NOT redeclare `CASettings`/`CASound` here (that throws
-// "Identifier 'CASettings' has already been declared" and stops app.js). Use
-// distinct local names bound to the globals instead.
+// same global scope, we must NOT redeclare `Settings`/`Sound`/`CASettings`/
+// `CASound` here (that throws "Identifier has already been declared" and stops
+// app.js). Use distinct local names bound to the globals instead.
 const CASettings = window.CA_Settings;
 const CASound = window.CA_Sound;
 
@@ -21,28 +22,46 @@ const GLYPHS = {
 
 // --- DOM refs ---
 const boardEl = document.getElementById("board");
-const turnEl = document.getElementById("turnIndicator");
-const messageEl = document.getElementById("message");
 const moveLogEl = document.getElementById("moveLog");
-const bannerEl = document.getElementById("banner");
 const thinkingEl = document.getElementById("thinking");
 const newGameBtn = document.getElementById("newGame");
+const resumeBtn = document.getElementById("resumeBtn");
 const resignBtn = document.getElementById("resignBtn");
 const promoOverlay = document.getElementById("promoOverlay");
 const promoChoices = document.getElementById("promoChoices");
 const threadsInput = document.getElementById("threads");
-const threadsBadge = document.getElementById("threadsBadge");
-// clocks
-const clockBlock = document.getElementById("clockBlock");
-const clockTopLabel = document.getElementById("clockTopLabel");
+// names / clocks / ratings around the board
 const clockTopTime = document.getElementById("clockTopTime");
-const clockBottomLabel = document.getElementById("clockBottomLabel");
 const clockBottomTime = document.getElementById("clockBottomTime");
+const ratingTop = document.getElementById("ratingTop");
+const ratingBottom = document.getElementById("ratingBottom");
+const humanNameEl = document.getElementById("humanName");
+const speechBubble = document.getElementById("speechBubble");
+// new-game popout
+const newGamePopout = document.getElementById("newGamePopout");
+const startGameBtn = document.getElementById("startGame");
+const cancelNewGameBtn = document.getElementById("cancelNewGame");
 const tcInputs = document.getElementById("tcInputs");
-// settings + replay
+// self-analysis
+const selfAnalysisRow = document.getElementById("selfAnalysisRow");
+const selfAnalysisToggle = document.getElementById("selfAnalysisToggle");
+// settings / profile disclosures
+const settingsToggle = document.getElementById("settingsToggle");
+const settingsBody = document.getElementById("settingsBody");
+const advancedToggle = document.getElementById("advancedToggle");
+const advancedBody = document.getElementById("advancedBody");
+const profileToggle = document.getElementById("profileToggle");
+const profileBody = document.getElementById("profileBody");
+const logoutBtn = document.getElementById("logoutBtn");
+// settings toggles
 const animToggle = document.getElementById("animToggle");
 const soundToggle = document.getElementById("soundToggle");
 const soundNote = document.getElementById("soundNote");
+// network error popout
+const netErrorOverlay = document.getElementById("netErrorOverlay");
+const netErrorText = document.getElementById("netErrorText");
+const netErrorClose = document.getElementById("netErrorClose");
+// replay/review controls
 const replayBlock = document.getElementById("replayBlock");
 const replayStatus = document.getElementById("replayStatus");
 const rFirst = document.getElementById("replayFirst");
@@ -50,6 +69,11 @@ const rPrev = document.getElementById("replayPrev");
 const rPlay = document.getElementById("replayPlay");
 const rNext = document.getElementById("replayNext");
 const rLast = document.getElementById("replayLast");
+// review Info disclosure (start/end time of the reviewed game)
+const reviewInfoToggle = document.getElementById("reviewInfoToggle");
+const reviewInfoBody = document.getElementById("reviewInfoBody");
+const reviewStartEl = document.getElementById("reviewStart");
+const reviewEndEl = document.getElementById("reviewEnd");
 
 // --- client state ---
 let state = null;
@@ -70,8 +94,20 @@ let humanClockAtResume = 0;      // human's remaining seconds at the moment his 
 let selected = null;
 let legalFrom = {};
 let busy = false;
+let playerRating = null;   // display ratings (null => not shown)
+let botRating = null;
 
-// replay state
+// in-game review state: when viewing an earlier ply of the LIVE game the
+// player may look but not move. reviewIndex === null means "on the last move".
+let reviewIndex = null;
+
+// self-analysis (casual only): a scratch layer over the real game.
+let selfAnalysis = false;
+let realState = null;      // preserved true game state while in self-analysis
+let realMoves = [];        // preserved true move list while in self-analysis
+let scratchMoves = [];     // moves array used only during self-analysis
+
+// finished-game replay state
 let replayMode = false;
 let replayMoves = [];   // full UCI move list of the finished game
 let replayIndex = 0;    // how many plies are shown (0..replayMoves.length)
@@ -105,6 +141,10 @@ function orientation() {
     rankOrder: flipped ? [...ranks].reverse() : ranks,
   };
 }
+
+// True when board interaction should be blocked (viewing an earlier ply of the
+// live game). Distinct from finished-game replay.
+function inReview() { return reviewIndex !== null; }
 
 function renderBoard() {
   boardEl.innerHTML = "";
@@ -155,57 +195,63 @@ function rebuildLegalMap() {
   }
 }
 
+// Render the move log. Each move span is clickable to jump the board to that
+// ply (in-game review). After the last move, when the game is over, append the
+// canonical result line ('1-0 (White won by checkmate)').
 function renderMoveLog() {
   moveLogEl.innerHTML = "";
-  const hist = state ? state.san_history : [];
-  for (let i = 0; i < hist.length; i += 2) {
+  // In finished-game replay, show the full game's move log/result (replayState);
+  // in normal/in-game-review play, show the current state's history.
+  const src = (replayMode && replayState) ? replayState.san_history : (state && state.san_history);
+  const h = src || [];
+  for (let i = 0; i < h.length; i += 2) {
     const li = document.createElement("li");
     li.value = i/2 + 1;
-    const w = document.createElement("span"); w.className = "white-move";
-    w.textContent = hist[i] || ""; li.appendChild(w);
-    if (hist[i+1] !== undefined) {
-      const b = document.createElement("span"); b.className = "black-move";
-      b.textContent = " " + hist[i+1]; li.appendChild(b);
+    const w = document.createElement("span");
+    w.className = "white-move move-link";
+    w.textContent = h[i] || "";
+    w.addEventListener("click", () => jumpToPly(i + 1));
+    li.appendChild(w);
+    if (h[i+1] !== undefined) {
+      const b = document.createElement("span");
+      b.className = "black-move move-link";
+      b.textContent = " " + h[i+1];
+      b.addEventListener("click", () => jumpToPly(i + 2));
+      li.appendChild(b);
     }
+    moveLogEl.appendChild(li);
+  }
+  // Result line after the last move (from FEAT-002 result_line).
+  const rl = replayMode ? (replayState && replayState.result_line)
+                        : (state && state.game_over ? state.result_line : null);
+  if (rl) {
+    const li = document.createElement("li");
+    li.className = "result-line";
+    li.value = "";
+    li.style.listStyle = "none";
+    li.textContent = rl;
     moveLogEl.appendChild(li);
   }
   moveLogEl.scrollTop = moveLogEl.scrollHeight;
 }
 
-function renderTurn() {
-  if (!state) { turnEl.textContent = ""; return; }
-  if (replayMode) { turnEl.textContent = "Replay mode"; return; }
-  if (state.game_over) { turnEl.textContent = "Game over"; return; }
-  turnEl.textContent = (state.turn === humanColor)
-    ? "Your move (" + humanColor + ")" : BOT_NAME + " to move";
+function renderThinking() {
+  if (thinkingEl) thinkingEl.hidden = !busy;
 }
 
-function bannerInfo(result, result_reason, color) {
-  // returns {text, cls} for a game-over result relative to `color`.
-  const reason = result_reason || "game over";
-  if (result === "1/2-1/2") return { text: "Draw by " + reason + ".", cls: "banner draw", kind: "draw" };
-  const humanIsWhite = color === "white";
-  const humanWon = (result === "1-0" && humanIsWhite) || (result === "0-1" && !humanIsWhite);
-  return humanWon
-    ? { text: "You beat " + BOT_NAME + " by " + reason + "!", cls: "banner win", kind: "win" }
-    : { text: BOT_NAME + " wins by " + reason + ".", cls: "banner loss", kind: "loss" };
-}
-
-function renderBanner() {
-  if (replayMode || !state || !state.game_over) { bannerEl.hidden = true; bannerEl.className = "banner"; return; }
-  bannerEl.hidden = false;
-  const info = bannerInfo(state.result, state.result_reason, humanColor);
-  bannerEl.textContent = info.text; bannerEl.className = info.cls;
-}
-
-function renderThreadsBadge() {
-  if (!threadsBadge) return;
-  threadsBadge.textContent = (state && typeof state.threads === "number")
-    ? "\u00b7 " + state.threads + (state.threads === 1 ? " thread" : " threads") : "";
-}
-function renderResign() {
-  if (!resignBtn) return;
-  resignBtn.hidden = !(inProgress && state && !state.game_over && !replayMode);
+function renderControls() {
+  // New Game shows when no game is active (load, after game over) and not
+  // reviewing a finished game. It is HIDDEN while a live game is in progress.
+  const liveGame = inProgress && state && !state.game_over && !replayMode;
+  const hasUnresumed = !!(pendingResume && !liveGame && !replayMode);
+  if (newGameBtn) newGameBtn.hidden = liveGame || replayMode || hasUnresumed;
+  if (resumeBtn) resumeBtn.hidden = !hasUnresumed;
+  if (resignBtn) resignBtn.hidden = !liveGame;
+  // Self-analysis: casual mode only, during a live game. Keep the row visible
+  // while self-analysis is active so the player can always turn it back OFF.
+  if (selfAnalysisRow) {
+    selfAnalysisRow.hidden = !(mode === "casual" && (liveGame || selfAnalysis));
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -214,6 +260,17 @@ function renderResign() {
 function fmtClock(sec) {
   if (sec == null) return "--:--";
   sec = Math.max(0, sec);
+  // Deciseconds precision ONLY when below 20 seconds, e.g. '19.4' / '0:08.7'.
+  if (sec < 20) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    if (m > 0) {
+      // pad the seconds to two integer digits, keeping one decimal.
+      const sStr = (s < 10 ? "0" : "") + s.toFixed(1);
+      return m + ":" + sStr;
+    }
+    return s.toFixed(1);
+  }
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   if (m >= 60) {
@@ -235,21 +292,22 @@ function liveHumanRemaining() {
 }
 
 function renderClocks() {
-  if (!clockBlock) return;
-  if (!clockState || replayMode) { clockBlock.hidden = true; return; }
-  clockBlock.hidden = false;
+  if (!clockTopTime || !clockBottomTime) return;
+  if (!clockState || replayMode) {
+    clockTopTime.hidden = true;
+    clockBottomTime.hidden = true;
+    return;
+  }
+  clockTopTime.hidden = false;
+  clockBottomTime.hidden = false;
   const botColor = humanColor === "white" ? "black" : "white";
-  // Top = opponent (Chess Amateur), bottom = human.
-  clockTopLabel.textContent = BOT_NAME;
-  clockBottomLabel.textContent = "You";
+  // Top = Chess Amateur, bottom = human.
   const humanRem = liveHumanRemaining();
   clockBottomTime.textContent = fmtClock(humanRem);
   clockTopTime.textContent = fmtClock(clockState[botColor]);
   // active/low styling
-  const bottomEl = clockBottomTime.parentElement;
-  const topEl = clockTopTime.parentElement;
-  bottomEl.className = "clock" + (humanClockRunning ? " active" : "") + (humanRem != null && humanRem < 10 ? " low" : "");
-  topEl.className = "clock" + (!humanClockRunning && state && !state.game_over ? " active" : "") + (clockState[botColor] != null && clockState[botColor] < 10 ? " low" : "");
+  clockBottomTime.className = "clock-time" + (humanClockRunning ? " active" : "") + (humanRem != null && humanRem < 10 ? " low" : "");
+  clockTopTime.className = "clock-time" + (!humanClockRunning && state && !state.game_over ? " active" : "") + (clockState[botColor] != null && clockState[botColor] < 10 ? " low" : "");
 }
 
 function startClockTicker() {
@@ -257,18 +315,12 @@ function startClockTicker() {
   if (!clockState) return;
   clockTicker = setInterval(() => {
     renderClocks();
-    // Client-side flag: if the human's live clock hits 0 while running, submit
-    // a forfeit by sending a move attempt with the elapsed >= remaining. We
-    // simply let the server enforce it on the next move; to end promptly we
-    // trigger a "timeout" move with a null move so the server flags. Simpler:
-    // once it hits 0, stop the human clock and show the loss locally; the
-    // server will finalize on the next interaction. To be safe we auto-submit.
     const rem = liveHumanRemaining();
     if (humanClockRunning && rem != null && rem <= 0) {
       humanClockRunning = false;
       submitTimeout();
     }
-  }, 200);
+  }, 100);
 }
 function stopClockTicker() {
   if (clockTicker) { clearInterval(clockTicker); clockTicker = null; }
@@ -278,6 +330,7 @@ function stopClockTicker() {
 // animation has ended and it is the human's turn (fairness rule).
 function resumeHumanClock() {
   if (!clockState || !state || state.game_over || replayMode) return;
+  if (inReview() || selfAnalysis) return;
   if (state.turn !== humanColor) return;
   humanClockAtResume = clockState[humanColor];
   humanTurnStart = performance.now();
@@ -291,16 +344,12 @@ function stopHumanClockAndGetElapsed() {
   if (!humanClockRunning) return 0;
   const elapsed = (performance.now() - humanTurnStart) / 1000;
   humanClockRunning = false;
-  // reflect locally (server will return the authoritative value)
   if (clockState) clockState[humanColor] = Math.max(0, humanClockAtResume - elapsed);
   renderClocks();
   return elapsed;
 }
 
 async function submitTimeout() {
-  // Human flagged locally: tell the server via a move with huge elapsed so it
-  // finalizes as a time forfeit. We send the last legal-looking move field but
-  // the server flags before applying it (elapsed >= remaining).
   if (busy || !state || !clockState) return;
   setBusy(true);
   try {
@@ -318,15 +367,37 @@ async function submitTimeout() {
   finally { setBusy(false); }
 }
 
+// -------------------------------------------------------------------------
+// Ratings around the names
+// -------------------------------------------------------------------------
+function fmtRating(r) {
+  if (r == null) return "";
+  const n = Number(r);
+  if (!isFinite(n)) return "";
+  return String(Math.round(n));
+}
+function renderRatings() {
+  if (!ratingTop || !ratingBottom) return;
+  // No ratings in casual mode / for guests (null values).
+  if (botRating == null || replayMode) { ratingTop.hidden = true; }
+  else { ratingTop.hidden = false; ratingTop.textContent = "(" + fmtRating(botRating) + ")"; }
+  if (playerRating == null || replayMode) { ratingBottom.hidden = true; }
+  else { ratingBottom.hidden = false; ratingBottom.textContent = "(" + fmtRating(playerRating) + ")"; }
+}
+
+function renderNames() {
+  if (humanNameEl) humanNameEl.textContent = HUMAN_NAME;
+}
+
 function renderAll() {
   rebuildLegalMap();
   renderBoard();
   renderMoveLog();
-  renderTurn();
-  renderBanner();
-  renderThreadsBadge();
-  renderResign();
+  renderThinking();
+  renderControls();
   renderClocks();
+  renderRatings();
+  renderNames();
 }
 
 // =========================================================================
@@ -339,8 +410,6 @@ function centerOf(square) {
   return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
 }
 
-// Animate the piece currently on `from` sliding to `to`, then run cb().
-// If animations are off (or the squares can't be found), cb() runs immediately.
 function animateSlide(from, to, cb) {
   if (!CASettings.animations) { cb(); return; }
   const fromSq = boardEl.querySelector('[data-square="' + from + '"]');
@@ -349,31 +418,34 @@ function animateSlide(from, to, cb) {
   if (!pieceEl || !a || !b) { cb(); return; }
   const dx = b.x - a.x, dy = b.y - a.y;
   pieceEl.classList.add("sliding");
-  // force reflow so the transition applies
   void pieceEl.offsetWidth;
   pieceEl.style.transform = "translate(" + dx + "px," + dy + "px)";
   let done = false;
   const finish = () => { if (done) return; done = true; cb(); };
   pieceEl.addEventListener("transitionend", finish, { once: true });
-  setTimeout(finish, ANIM_MS + 80); // fallback if transitionend doesn't fire
+  setTimeout(finish, ANIM_MS + 80);
 }
 
 // =========================================================================
 // Interaction (live play)
 // =========================================================================
-function clearMessage() { messageEl.textContent = ""; }
-function showMessage(m) { messageEl.textContent = m; }
-function humansTurnNow() { return state && !state.game_over && !replayMode && state.turn === humanColor; }
+function humansTurnNow() {
+  if (!state || state.game_over || replayMode || inReview()) return false;
+  if (selfAnalysis) return true;   // human moves for both sides
+  return state.turn === humanColor;
+}
 
 function onSquareClick(name) {
   if (busy || !state || state.game_over || replayMode) return;
+  // In-game review: viewing an earlier ply -> look only, no moves.
+  if (inReview()) return;
   if (!humansTurnNow()) return;
   const pieces = parseFen(state.fen);
   if (selected && legalFrom[selected] && legalFrom[selected].includes(name)) {
     attemptMove(selected, name, pieces[selected]); return;
   }
   if (legalFrom[name] && legalFrom[name].length > 0) {
-    selected = name; clearMessage(); renderBoard(); return;
+    selected = name; renderBoard(); return;
   }
   selected = null; renderBoard();
 }
@@ -385,12 +457,16 @@ function needsPromotion(fromPiece, toSquare) {
 }
 function attemptMove(from, to, fromPiece) {
   if (needsPromotion(fromPiece, to)) {
-    askPromotion((promo) => { if (!promo) { selected = null; renderBoard(); return; } sendMove(from + to + promo, from, to); });
-  } else sendMove(from + to, from, to);
+    askPromotion((promo) => { if (!promo) { selected = null; renderBoard(); return; } commitMove(from + to + promo, from, to); });
+  } else commitMove(from + to, from, to);
+}
+function commitMove(uci, fromSq, toSq) {
+  if (selfAnalysis) { selfAnalysisMove(uci, fromSq, toSq); return; }
+  sendMove(uci, fromSq, toSq);
 }
 function askPromotion(cb) {
   promoChoices.innerHTML = "";
-  const whiteSide = humanColor === "white";
+  const whiteSide = selfAnalysis ? (state.turn === "white") : (humanColor === "white");
   for (const opt of ["q","r","b","n"]) {
     const btn = document.createElement("button");
     btn.type = "button";
@@ -406,9 +482,10 @@ function askPromotion(cb) {
 // =========================================================================
 function setBusy(on) {
   busy = on;
-  thinkingEl.hidden = !on;
+  if (thinkingEl) thinkingEl.hidden = !on;
   if (newGameBtn) newGameBtn.disabled = on;
   if (resignBtn) resignBtn.disabled = on;
+  if (resumeBtn) resumeBtn.disabled = on;
 }
 function adoptState(s) {
   state = s;
@@ -420,12 +497,11 @@ function adoptState(s) {
   if (typeof s.mode === "string") mode = s.mode;
   if ("base_seconds" in s) baseSeconds = s.base_seconds;
   if ("increment" in s) increment = s.increment || 0;
-  // Absorb the authoritative clock from the server (null => unlimited).
   if ("clock" in s) clockState = s.clock ? { white: s.clock.white, black: s.clock.black } : null;
+  if ("player_rating" in s) playerRating = s.player_rating;
+  if ("bot_rating" in s) botRating = s.bot_rating;
 }
 
-// FEN "side to move" after applying our moves lets us detect check via the
-// server state; simpler: infer check from SAN ('+' or '#') in san_history.
 function lastSanIndicatesCheck(s) {
   const h = s && s.san_history;
   if (!h || !h.length) return false;
@@ -433,32 +509,19 @@ function lastSanIndicatesCheck(s) {
   return last.includes("+") || last.includes("#");
 }
 
-// Play the sound appropriate to the new state after a move resolves.
-function playMoveSounds(prev, next) {
-  if (!CASettings.sound) return;
-  if (next.game_over) {
-    // Move knock first (the move that ended it), then the end tune.
-    const info = bannerInfo(next.result, next.result_reason, humanColor);
-    if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
-    setTimeout(() => {
-      if (info.kind === "win") CASound.win();
-      else if (info.kind === "draw") CASound.draw();
-      else CASound.loss();
-    }, 180);
-  } else {
-    if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
-  }
+// kind of result relative to the human, used for sound selection.
+function resultKind(result) {
+  if (result === "1/2-1/2") return "draw";
+  const humanIsWhite = humanColor === "white";
+  const humanWon = (result === "1-0" && humanIsWhite) || (result === "0-1" && !humanIsWhite);
+  return humanWon ? "win" : "loss";
 }
 
 async function sendMove(uci, fromSq, toSq) {
   if (busy || !state) return;
-  // Fairness rule: stop the human's clock the INSTANT he commits the move and
-  // capture the elapsed time NOW (before any animation), so the slide/network
-  // don't eat into his clock. Server is authoritative and clamps/flags.
   const elapsed = stopHumanClockAndGetElapsed();
   const clockSnapshot = clockState ? { white: clockState.white, black: clockState.black } : null;
-  setBusy(true); selected = null; clearMessage();
-  // Animate the human's piece sliding first (if enabled), then post.
+  setBusy(true); selected = null;
   const doPost = async () => {
     try {
       const res = await fetch("/api/move", {
@@ -470,26 +533,18 @@ async function sendMove(uci, fromSq, toSq) {
           clock: clockSnapshot, elapsed: elapsed,
         }),
       });
-      if (res.status === 400) { showMessage("Illegal move. Try a different move."); renderBoard(); return; }
-      if (!res.ok) { showMessage("Server error (" + res.status + ")."); return; }
+      // Illegal move: silently disallow, just re-render (no message/hint).
+      if (res.status === 400) { renderBoard(); setBusy(false); return; }
+      if (!res.ok) { showNetworkError("Server error (" + res.status + ")."); setBusy(false); return; }
       const next = await res.json();
       const botUci = next.last_bot_move ? next.last_bot_move.uci : null;
 
-      // BUG-FIX 1 (sound ordering): play the HUMAN's move sound NOW, the moment
-      // his move resolves on the server -- not later, buried in the bot's
-      // animation path. Human's own move (check knock if it gave check, else a
-      // normal knock). If the human's move ended the game, play the end tune.
       playHumanMoveSound(next, botUci);
 
-      // BUG-FIX 2 (instant bot move): in FIDE mode Chess Amateur must actually
-      // WAIT its computed think-time before revealing its move, with its clock
-      // ticking down live (the human's clock stays stopped -- fairness). Only
-      // after the pause do we reveal/animate the reply.
       const botThink = (typeof next.bot_think === "number") ? next.bot_think : 0;
 
       const revealBot = () => {
         if (!botUci) {
-          // No bot reply (human move ended the game): just commit + resume.
           adoptState(next);
           renderAll();
           afterMoveResolved();
@@ -497,8 +552,6 @@ async function sendMove(uci, fromSq, toSq) {
           return;
         }
         if (CASettings.animations) {
-          // Show the INTERMEDIATE position (human moved, bot not yet) so the
-          // bot's piece is on its origin square, then slide it.
           revealBotAnimated(next, botUci);
         } else {
           adoptState(next);
@@ -510,12 +563,12 @@ async function sendMove(uci, fromSq, toSq) {
       };
 
       if (botUci && botThink > 0) {
-        holdForBotThink(next, botThink, revealBot);   // ticks bot clock, then reveals
+        holdForBotThink(next, botThink, revealBot);
       } else {
         revealBot();
       }
     } catch (e) {
-      showMessage("Network error. Please try again.");
+      showNetworkError("A network error occurred. Please try again.");
       setBusy(false);
     }
   };
@@ -523,22 +576,17 @@ async function sendMove(uci, fromSq, toSq) {
   else doPost();
 }
 
-// Sound for the HUMAN's own move, played immediately when it resolves.
-// san_history layout after a move: [..., humanSan] or [..., humanSan, botSan].
-// If there is a bot reply (botUci set), the human's SAN is the second-to-last;
-// otherwise (human move ended the game) it's the last entry.
 function playHumanMoveSound(next, botUci) {
   if (!CASettings.sound) return;
   const h = next.san_history || [];
   const humanSan = botUci ? h[h.length - 2] : h[h.length - 1];
   const humanGaveCheckOrMate = humanSan && (humanSan.includes("+") || humanSan.includes("#"));
-  // If the human's move ended the game, play the end tune for the human's move.
   if (next.game_over && !botUci) {
-    const info = bannerInfo(next.result, next.result_reason, humanColor);
+    const kind = resultKind(next.result);
     if (humanGaveCheckOrMate) CASound.check(); else CASound.move();
     setTimeout(() => {
-      if (info.kind === "win") CASound.win();
-      else if (info.kind === "draw") CASound.draw();
+      if (kind === "win") CASound.win();
+      else if (kind === "draw") CASound.draw();
       else CASound.loss();
     }, 180);
   } else {
@@ -546,16 +594,13 @@ function playHumanMoveSound(next, botUci) {
   }
 }
 
-// Hold Chess Amateur's move for `seconds` (its real think-time), ticking its
-// clock down live while the human's clock stays stopped (fairness). Calls
-// `done()` once the pause elapses. A "thinking" indicator is shown throughout.
 function holdForBotThink(next, seconds, done) {
   const botColor = humanColor === "white" ? "black" : "white";
   const startClock = (next.clock && next.clock[botColor] != null)
-    ? next.clock[botColor] + seconds   // clock in `next` already has think-time deducted;
-    : null;                            // add it back so we can animate it counting down
+    ? next.clock[botColor] + seconds
+    : null;
   const t0 = performance.now();
-  thinkingEl.hidden = false;
+  if (thinkingEl) thinkingEl.hidden = false;
   const tick = setInterval(() => {
     const elapsed = (performance.now() - t0) / 1000;
     if (clockState && startClock != null) {
@@ -564,7 +609,7 @@ function holdForBotThink(next, seconds, done) {
     }
     if (elapsed >= seconds) {
       clearInterval(tick);
-      thinkingEl.hidden = true;
+      if (thinkingEl) thinkingEl.hidden = true;
       done();
     }
   }, 100);
@@ -600,15 +645,14 @@ function revealBotAnimated(next, botUci) {
     .catch(() => finish(null));
 }
 
-// CASound after the bot's move resolves (check knock or end tune).
 function playBotResolutionSound(next) {
   if (!CASettings.sound) return;
   if (next.game_over) {
-    const info = bannerInfo(next.result, next.result_reason, humanColor);
+    const kind = resultKind(next.result);
     if (lastSanIndicatesCheck(next)) CASound.check(); else CASound.move();
     setTimeout(() => {
-      if (info.kind === "win") CASound.win();
-      else if (info.kind === "draw") CASound.draw();
+      if (kind === "win") CASound.win();
+      else if (kind === "draw") CASound.draw();
       else CASound.loss();
     }, 180);
   } else {
@@ -617,23 +661,27 @@ function playBotResolutionSound(next) {
 }
 
 // Called once a move (and Chess Amateur's animated reply) has fully resolved.
-// Handles game-over (show rating delta, stop clocks) or resumes the human's
-// clock per the fairness rule.
 function afterMoveResolved() {
   if (state && state.game_over) {
     stopClockTicker();
     humanClockRunning = false;
     showRatingDelta(state.rating_delta);
+    renderControls();
     return;
   }
-  // Fairness: the human's clock only starts now (after CA's animation ended).
+  if (selfAnalysis) return;   // no clock during self-analysis
   if (clockState) { resumeHumanClock(); startClockTicker(); }
 }
 
+// On game end, update the displayed player rating (the server returns the new
+// player_rating) and show the signed delta ('+0' when zero) next to the name.
 function showRatingDelta(delta) {
+  renderRatings();
   if (!delta) return;   // casual / guest -> nothing to show
-  // delta is a self-describing string, e.g. "+6.40 FIDE classical" or "-12.34".
-  showMessage("Rating change: " + delta);
+  if (ratingBottom && playerRating != null) {
+    ratingBottom.hidden = false;
+    ratingBottom.textContent = "(" + fmtRating(playerRating) + " " + delta + ")";
+  }
 }
 
 function chosenThreads() {
@@ -644,7 +692,6 @@ function chosenThreads() {
   return n;
 }
 
-// Read mode + time control from the controls for a new game.
 function chosenMode() {
   const el = document.querySelector('input[name="mode"]:checked');
   return el ? el.value : "casual";
@@ -659,16 +706,51 @@ function chosenTimeControl() {
   return { unlimited: false, hours: h, minutes: m, seconds: s, increment: inc };
 }
 
-async function newGame() {
+// =========================================================================
+// New Game popout
+// =========================================================================
+function openNewGamePopout() {
+  hideSpeechBubble();
+  if (newGamePopout) newGamePopout.hidden = false;
+  syncTcInputs();
+}
+function closeNewGamePopout() {
+  if (newGamePopout) newGamePopout.hidden = true;
+}
+function syncTcInputs() {
+  const tcEl = document.querySelector('input[name="tc"]:checked');
+  const unlimited = tcEl && tcEl.value === "unlimited";
+  if (tcInputs) tcInputs.hidden = !!unlimited;
+}
+
+// Impatience speech bubble under Chess Amateur.
+function showSpeechBubble(text) {
+  if (!speechBubble) return;
+  speechBubble.textContent = text;
+  speechBubble.hidden = false;
+}
+function hideSpeechBubble() {
+  if (!speechBubble) return;
+  speechBubble.hidden = true;
+  speechBubble.textContent = "";
+}
+
+// Start is the only path that begins a game (from the popout's chosen values).
+async function startNewGame() {
+  hideSpeechBubble();
   exitReplay();
   stopClockTicker();
+  reviewIndex = null;
+  selfAnalysis = false;
+  if (selfAnalysisToggle) selfAnalysisToggle.checked = false;
   const chosen = document.querySelector('input[name="color"]:checked');
   humanColor = chosen ? chosen.value : "white";
   threadsCount = chosenThreads();
   mode = chosenMode();
   const tc = chosenTimeControl();
   moves = []; startedAt = null; clockState = null; humanClockRunning = false;
-  setBusy(true); selected = null; clearMessage(); bannerEl.hidden = true;
+  playerRating = null; botRating = null;
+  setBusy(true); selected = null;
   try {
     const body = Object.assign(
       { human_color: humanColor, threads: threadsCount, mode: mode }, tc);
@@ -678,23 +760,27 @@ async function newGame() {
     });
     if (res.status === 409) {
       const data = await res.json();
-      showMessage((data && data.error) || "You have a game in progress.");
-      await resumeInProgress();
+      // A game is already in progress: surface a Resume affordance instead.
+      closeNewGamePopout();
+      await refreshInProgress();
       return;
     }
     if (res.status === 400) {
-      // e.g. the correspondence-chess message for >= 1 day.
+      // e.g. the correspondence-chess message for >= 1 day -> impatience bubble;
+      // the game does NOT start and the popout stays open.
       const data = await res.json();
-      showMessage((data && data.error) || "Invalid time control.");
+      showSpeechBubble((data && data.error) || "I don't want to play that.");
       return;
     }
-    if (!res.ok) { showMessage("Could not start a new game (" + res.status + ")."); return; }
+    if (!res.ok) { showNetworkError("Could not start a new game (" + res.status + ")."); return; }
+    pendingResume = null;
+    closeNewGamePopout();
     adoptState(await res.json());
     renderAll();
     if (state.last_bot_move && CASettings.sound) CASound.move();
-    afterMoveResolved();   // start the human clock (fairness) once it's his turn
+    afterMoveResolved();
   } catch (e) {
-    showMessage("Network error starting game.");
+    showNetworkError("A network error occurred starting the game.");
   } finally { setBusy(false); }
 }
 
@@ -708,34 +794,55 @@ async function resign() {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mode: mode }),
     });
-    if (!res.ok) { showMessage("Could not resign (" + res.status + ")."); return; }
+    if (!res.ok) { showNetworkError("Could not resign (" + res.status + ")."); return; }
     const data = await res.json();
     inProgress = false;
     if (state) {
       state.game_over = true;
       state.result = data.result || (humanColor === "white" ? "0-1" : "1-0");
       state.result_reason = "resignation";
+      if (data.result_line) state.result_line = data.result_line;
+      else {
+        const winner = state.result === "1-0" ? "White" : "Black";
+        state.result_line = state.result + " (" + winner + " won by resignation)";
+      }
       state.legal_moves = [];
+      if ("player_rating" in data) playerRating = data.player_rating;
+      if ("bot_rating" in data) botRating = data.bot_rating;
+      state.rating_delta = data.rating_delta;
     }
     renderAll();
     if (CASettings.sound) CASound.loss();
-    if (data.rating_delta) showMessage("You resigned. Rating change: " + data.rating_delta);
-    else showMessage("You resigned. See it in \u201CMy games\u201D.");
+    showRatingDelta(data.rating_delta);
   } catch (e) {
-    showMessage("Network error resigning.");
+    showNetworkError("A network error occurred resigning.");
   } finally { setBusy(false); }
 }
 
-async function resumeInProgress() {
+// =========================================================================
+// In-progress game (Resume) — never auto-resumes on load.
+// =========================================================================
+let pendingResume = null;   // the in-progress game info awaiting a Resume click
+
+async function refreshInProgress() {
+  if (!CFG.loggedIn) { pendingResume = null; renderControls(); return; }
   try {
     const res = await fetch("/api/in-progress");
-    if (!res.ok) return false;
+    if (!res.ok) { pendingResume = null; renderControls(); return; }
     const data = await res.json();
-    if (!data.in_progress) return false;
-    const g = data.in_progress;
-    await renderFromMoves(g.moves || [], g.human_color, g.started_at, true, g);
-    return true;
-  } catch (e) { return false; }
+    pendingResume = data.in_progress || null;
+  } catch (e) { pendingResume = null; }
+  renderControls();
+}
+
+// Resume starts the clock (the player's clock starts only on resume).
+async function resumeInProgress() {
+  if (!pendingResume) return false;
+  const g = pendingResume;
+  await renderFromMoves(g.moves || [], g.human_color, g.started_at, true, g);
+  pendingResume = null;
+  renderControls();
+  return true;
 }
 
 async function renderFromMoves(moveList, color, started, live, resumeInfo) {
@@ -751,18 +858,19 @@ async function renderFromMoves(moveList, color, started, live, resumeInfo) {
   startedAt = started || s.started_at;
   inProgress = !!live;
   replayMode = false;
-  // Restore mode/time-control + the LIVE clock for a resumed game. The server
-  // persists each side's remaining time on every autosave, so a resumed game
-  // continues with the correct clock rather than restarting at the base time.
+  reviewIndex = null;
   if (live && resumeInfo) {
     baseSeconds = resumeInfo.base_seconds != null ? resumeInfo.base_seconds : null;
     increment = resumeInfo.increment || 0;
+    mode = resumeInfo.mode || mode;
+    if (typeof resumeInfo.player_rating !== "undefined") playerRating = resumeInfo.player_rating;
+    if (typeof resumeInfo.bot_rating !== "undefined") botRating = resumeInfo.bot_rating;
     if (baseSeconds == null) {
-      clockState = null;                 // unlimited
+      clockState = null;
     } else if (resumeInfo.clock && resumeInfo.clock.white != null) {
       clockState = { white: resumeInfo.clock.white, black: resumeInfo.clock.black };
     } else {
-      clockState = { white: baseSeconds, black: baseSeconds };  // fallback
+      clockState = { white: baseSeconds, black: baseSeconds };
     }
     humanClockRunning = false;
   }
@@ -771,8 +879,144 @@ async function renderFromMoves(moveList, color, started, live, resumeInfo) {
 }
 
 // =========================================================================
-// Replay of finished games (read-only) with transport controls
+// In-game review: click a move in the log to jump the board to that ply.
+// The player can only MAKE a move when on the last (current) position.
+// This is a lightweight look-only layer over the LIVE game (distinct from the
+// finished-game replay controls). The true live state is snapshotted so the
+// full move log + result line stay visible while the board shows an old ply.
 // =========================================================================
+let reviewReqSeq = 0;
+let liveSnapshot = null;   // preserved true live state while reviewing
+
+async function jumpToPly(ply) {
+  if (replayMode || !state) return;
+  // Capture the live state the first time we leave the last move.
+  if (!inReview()) liveSnapshot = state;
+  const source = liveSnapshot || state;
+  const total = (source.san_history || moves).length;
+  const target = Math.max(0, Math.min(total, ply));
+  if (target >= total) { returnToLive(); return; }
+  reviewIndex = target;
+  selected = null;
+  stopClockTicker();
+  humanClockRunning = false;
+  const myReq = ++reviewReqSeq;
+  const partial = moves.slice(0, target);
+  let res;
+  try {
+    res = await fetch("/api/view", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ moves: partial, human_color: humanColor }),
+    });
+  } catch (e) { showNetworkError("A network error occurred loading that position."); return; }
+  if (!res.ok) return;
+  const data = await res.json();
+  if (myReq !== reviewReqSeq) return;
+  // Show only the reviewed position; keep the real game's move log/result.
+  state = Object.assign({}, data, {
+    san_history: liveSnapshot.san_history,
+    result_line: liveSnapshot.result_line,
+    game_over: liveSnapshot.game_over,
+  });
+  legalFrom = {};   // no interaction while reviewing
+  renderBoard();
+  renderMoveLog();
+  renderClocks();
+}
+
+async function returnToLive() {
+  if (!liveSnapshot) { reviewIndex = null; return; }
+  reviewIndex = null;
+  state = liveSnapshot;
+  liveSnapshot = null;
+  selected = null;
+  renderAll();
+  // Restore clock behaviour (resume the human clock if it's his turn).
+  if (inProgress && state && !state.game_over && clockState) {
+    resumeHumanClock();
+    startClockTicker();
+  }
+}
+
+// =========================================================================
+// Self-analysis (Casual only): scratch layer over the real game state.
+// =========================================================================
+function setSelfAnalysis(on) {
+  if (on) {
+    if (mode !== "casual" || !state || state.game_over) { if (selfAnalysisToggle) selfAnalysisToggle.checked = false; return; }
+    // Preserve the true game state + moves and freeze the clock.
+    realState = state;
+    realMoves = moves.slice();
+    scratchMoves = moves.slice();
+    stopClockTicker();
+    humanClockRunning = false;
+    selfAnalysis = true;
+    reviewIndex = null;
+    renderAll();
+  } else {
+    // Return the board EXACTLY to the real game position.
+    selfAnalysis = false;
+    if (realState) {
+      state = realState;
+      moves = realMoves.slice();
+    }
+    realState = null;
+    scratchMoves = [];
+    renderAll();
+    if (inProgress && state && !state.game_over && clockState) {
+      resumeHumanClock();
+      startClockTicker();
+    }
+  }
+}
+
+// Apply a human move on the scratch board via /api/view (no engine reply, real
+// server game state untouched). Both sides are moved by the human.
+async function selfAnalysisMove(uci, fromSq, toSq) {
+  if (busy || !state) return;
+  // client-side legality check against the current legal map
+  if (!(legalFrom[fromSq] && legalFrom[fromSq].includes(toSq))) { renderBoard(); return; }
+  setBusy(true); selected = null;
+  const apply = async () => {
+    const next = scratchMoves.slice();
+    next.push(uci);
+    try {
+      const res = await fetch("/api/view", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ moves: next, human_color: humanColor }),
+      });
+      if (!res.ok) { renderBoard(); setBusy(false); return; }
+      const s = await res.json();
+      scratchMoves = next;
+      // Keep self-analysis fields on the scratch state; do NOT touch realState.
+      state = s;
+      moves = scratchMoves;
+      if (CASettings.sound) { if (lastSanIndicatesCheck(s)) CASound.check(); else CASound.move(); }
+      renderAll();
+    } catch (e) {
+      showNetworkError("A network error occurred.");
+    } finally { setBusy(false); }
+  };
+  if (CASettings.animations) animateSlide(fromSq, toSq, apply);
+  else apply();
+}
+
+// =========================================================================
+// Network-error popout (cancellable)
+// =========================================================================
+function showNetworkError(text) {
+  if (!netErrorOverlay) return;
+  if (netErrorText) netErrorText.textContent = text || "A network error occurred. Please try again.";
+  netErrorOverlay.hidden = false;
+}
+function hideNetworkError() {
+  if (netErrorOverlay) netErrorOverlay.hidden = true;
+}
+
+// =========================================================================
+// Review of finished games (read-only) with transport controls
+// =========================================================================
+let replayState = null;   // the finished game's full state (for move log/result)
 function exitReplay() {
   replayMode = false;
   stopAutoplay();
@@ -782,26 +1026,37 @@ function exitReplay() {
 async function startReplay(gameId) {
   try {
     const res = await fetch("/api/games/" + encodeURIComponent(gameId));
-    if (!res.ok) { showMessage("Could not load that game."); return; }
+    if (!res.ok) { showNetworkError("Could not load that game."); return; }
     const g = (await res.json()).game;
     replayMode = true;
     replayMoves = g.moves || [];
     humanColor = g.human_color;
     replayIndex = replayMoves.length;   // start at final position
     replayBlock.classList.add("active");
-    resignBtn.hidden = true;
+    // Populate the review Info disclosure with the game's start/end time (to
+    // the second, straight from the stored timestamps). Ongoing/unfinished
+    // games have no end time yet.
+    if (reviewStartEl) reviewStartEl.textContent = g.started_at || "\u2014";
+    if (reviewEndEl) reviewEndEl.textContent = g.ended_at || "\u2014";
+    // The reviewed game belongs to the current user: show their username below
+    // the board (the FEAT-003 tiny name row).
+    if (humanNameEl) humanNameEl.textContent = HUMAN_NAME;
+    if (resignBtn) resignBtn.hidden = true;
+    if (newGameBtn) newGameBtn.hidden = true;
+    // Load the full final state so we can show the move log + result line.
+    try {
+      const fres = await fetch("/api/view", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ moves: replayMoves, human_color: humanColor }),
+      });
+      replayState = fres.ok ? await fres.json() : null;
+    } catch (e) { replayState = null; }
     await renderReplayPosition();
-    showMessage("Replaying a finished game (read-only).");
-  } catch (e) { showMessage("Network error loading game."); }
+  } catch (e) { showNetworkError("A network error occurred loading the game."); }
 }
 
-let replayReqSeq = 0;   // guards against out-of-order /api/view responses
+let replayReqSeq = 0;
 async function renderReplayPosition() {
-  // Render the position after the first `replayIndex` plies. Guard against
-  // races: during 1s autoplay, multiple /api/view fetches may be in flight;
-  // only the most recent request is allowed to update the board so a slow
-  // earlier response can't clobber a newer position (which looked like the
-  // board "sticking" on an early move).
   const myReq = ++replayReqSeq;
   const idxAtRequest = replayIndex;
   const partial = replayMoves.slice(0, idxAtRequest);
@@ -814,7 +1069,7 @@ async function renderReplayPosition() {
   } catch (e) { return; }
   if (!res.ok) return;
   const data = await res.json();
-  if (myReq !== replayReqSeq) return;   // a newer request superseded this one
+  if (myReq !== replayReqSeq) return;
   state = data;
   replayMode = true;
   renderAll();
@@ -827,7 +1082,7 @@ function updateReplayControls() {
   rFirst.disabled = atStart; rPrev.disabled = atStart;
   rNext.disabled = atEnd; rLast.disabled = atEnd;
   replayStatus.textContent = "Move " + replayIndex + " / " + replayMoves.length;
-  rPlay.textContent = replayTimer ? "\u23F8" : "\u23EF"; // pause vs play glyph
+  rPlay.textContent = replayTimer ? "\u23F8" : "\u23EF";
 }
 
 function replayGoto(i) {
@@ -838,12 +1093,12 @@ function replayStep(delta) { stopAutoplay(); replayGoto(replayIndex + delta); }
 
 function startAutoplay() {
   if (replayTimer) return;
-  if (replayIndex >= replayMoves.length) replayIndex = 0; // restart if at end
+  if (replayIndex >= replayMoves.length) replayIndex = 0;
   replayTimer = setInterval(() => {
     if (replayIndex >= replayMoves.length) { stopAutoplay(); updateReplayControls(); return; }
     replayIndex += 1;
     renderReplayPosition();
-  }, 1000); // 1 move per second
+  }, 1000);
   updateReplayControls();
 }
 function stopAutoplay() {
@@ -852,12 +1107,11 @@ function stopAutoplay() {
 function toggleAutoplay() { replayTimer ? stopAutoplay() : startAutoplay(); updateReplayControls(); }
 
 // =========================================================================
-// CASettings toggles (with the sound-needs-animations dependency)
+// Settings toggles (with the sound-needs-animations dependency)
 // =========================================================================
 function syncToggleUI() {
   animToggle.checked = CASettings.animations;
   soundToggle.checked = CASettings.sound;
-  // CASound toggle is disabled + greyed when animations are off.
   soundToggle.disabled = !CASettings.animations;
   soundNote.hidden = CASettings.animations;
 }
@@ -870,32 +1124,80 @@ function wireSettings() {
   soundToggle.addEventListener("change", () => {
     CASettings.setSound(soundToggle.checked);
     syncToggleUI();
-    // A tiny knock confirms sound is on (and satisfies the user-gesture
-    // requirement to unlock audio).
     if (CASettings.sound) CASound.move();
+  });
+}
+
+// Generic disclosure toggle using the [hidden] attribute.
+function wireDisclosure(toggleBtn, body) {
+  if (!toggleBtn || !body) return;
+  toggleBtn.addEventListener("click", () => {
+    const open = body.hidden;
+    body.hidden = !open;
+    toggleBtn.setAttribute("aria-expanded", open ? "true" : "false");
+    toggleBtn.classList.toggle("open", open);
   });
 }
 
 // =========================================================================
 // Wire up + initial load
 // =========================================================================
-if (newGameBtn) newGameBtn.addEventListener("click", newGame);
+if (newGameBtn) newGameBtn.addEventListener("click", openNewGamePopout);
+if (startGameBtn) startGameBtn.addEventListener("click", startNewGame);
+if (cancelNewGameBtn) cancelNewGameBtn.addEventListener("click", closeNewGamePopout);
+if (resumeBtn) resumeBtn.addEventListener("click", resumeInProgress);
 if (resignBtn) resignBtn.addEventListener("click", resign);
+if (selfAnalysisToggle) selfAnalysisToggle.addEventListener("change", () => setSelfAnalysis(selfAnalysisToggle.checked));
+if (netErrorClose) netErrorClose.addEventListener("click", hideNetworkError);
+if (logoutBtn) logoutBtn.addEventListener("click", async () => {
+  try {
+    await fetch("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+  } catch (e) { /* ignore */ }
+  window.location.href = "/";
+});
+// time-control radios toggle the h/m/s inputs
+const tcRadios = document.querySelectorAll('input[name="tc"]');
+for (let i = 0; i < tcRadios.length; i++) tcRadios[i].addEventListener("change", syncTcInputs);
+
+wireDisclosure(settingsToggle, settingsBody);
+wireDisclosure(advancedToggle, advancedBody);
+wireDisclosure(profileToggle, profileBody);
+wireDisclosure(reviewInfoToggle, reviewInfoBody);
+
 if (rFirst) rFirst.addEventListener("click", () => replayStep(-replayMoves.length));
 if (rPrev) rPrev.addEventListener("click", () => replayStep(-1));
 if (rPlay) rPlay.addEventListener("click", toggleAutoplay);
 if (rNext) rNext.addEventListener("click", () => replayStep(1));
 if (rLast) rLast.addEventListener("click", () => replayStep(replayMoves.length));
 
+// Render a static starting position with no clock running, no game in progress.
+async function renderStartPosition() {
+  try {
+    const res = await fetch("/api/view", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ moves: [], human_color: humanColor }),
+    });
+    if (res.ok) {
+      state = await res.json();
+    }
+  } catch (e) { /* leave board empty on failure */ }
+  moves = [];
+  inProgress = false;
+  clockState = null;
+  humanClockRunning = false;
+  replayMode = false;
+  reviewIndex = null;
+  renderAll();
+}
+
 async function init() {
   wireSettings();
   const params = new URLSearchParams(window.location.search);
   const replayId = params.get("replay");
   if (CFG.loggedIn && replayId) { await startReplay(replayId); return; }
-  if (CFG.loggedIn) {
-    const resumed = await resumeInProgress();
-    if (resumed) { showMessage("Resumed your game in progress."); return; }
-  }
-  await newGame();
+  // NO auto-start / NO auto-resume / NO auto-clock. Show the starting position.
+  await renderStartPosition();
+  // If logged in, surface a Resume affordance (does NOT start the clock).
+  if (CFG.loggedIn) { await refreshInProgress(); }
 }
 init();

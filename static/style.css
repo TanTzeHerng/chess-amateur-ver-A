@@ -47,23 +47,56 @@ a:hover { color: var(--white); }
 }
 .topbar h1 { margin: 0; font-size: 1.3rem; color: var(--cyan); }
 .bot-name { color: var(--magenta); }
-.account-nav { display: flex; align-items: center; gap: .75rem; font-size: .9rem; color: var(--white); }
+.account-nav { display: flex; align-items: flex-start; gap: .75rem; font-size: .9rem; color: var(--white); }
 .account-nav .who { color: var(--green); }
-.navlink { color: var(--yellow); text-decoration: none; border-bottom: 1px solid var(--black); }
+.navlink { color: var(--yellow); text-decoration: none; border-bottom: 1px solid var(--black); display: block; }
 .navlink:hover { border-bottom-color: var(--yellow); }
-.btnlink { background: none; border: none; color: var(--yellow); cursor: pointer; font: inherit; padding: 0; }
+.btnlink { background: none; border: none; color: var(--yellow); cursor: pointer; font: inherit; padding: 0; text-align: left; }
+
+/* ---- disclosures (Settings / Advanced / Profile) ---- */
+.disclosure { position: relative; }
+.disclosure-toggle {
+  background: var(--black); color: var(--cyan); border: 1px solid var(--cyan);
+  font: inherit; cursor: pointer; padding: .2rem .5rem;
+}
+.disclosure-toggle:hover { background: var(--cyan); color: var(--black); }
+.disclosure-toggle .arrow { color: var(--yellow); display: inline-block; }
+.disclosure-toggle.open .arrow { color: var(--green); }
+.disclosure-body {
+  border: 1px solid var(--blue); background: var(--black);
+  padding: .4rem .5rem; margin-top: .2rem; min-width: 10rem;
+}
+.disclosure-body .toggle-row { display: flex; align-items: center; justify-content: space-between; margin: .3rem 0; }
+.disclosure-body label { color: var(--white); }
+.disclosure-body input[type="checkbox"] { width: 1.1rem; height: 1.1rem; accent-color: var(--magenta); }
+.disclosure-body .disabled-note { color: var(--red); font-size: .75rem; margin: .2rem 0; }
+#advancedTab { margin-top: .4rem; }
 
 /* ---- layout ---- */
 .layout { display: flex; flex-wrap: wrap; gap: 1rem; padding: 1rem; align-items: flex-start; }
 .board-area { flex: 1 1 380px; }
 .panel { flex: 0 0 280px; }
 
-.opponent-strip {
-  display: flex; justify-content: space-between; align-items: center;
-  color: var(--white); margin-bottom: .5rem; min-height: 1.4rem;
+.thinking { color: var(--yellow); font-size: .7rem; }
+
+/* ---- tiny name + clock + rating rows around the board ---- */
+.name-row {
+  display: flex; align-items: center; gap: .4rem;
+  font-size: .7rem; color: var(--white); min-height: 1rem;
+  max-width: 480px;
 }
-.threads-badge { color: var(--green); }
-.thinking { color: var(--yellow); }
+.name-row .player-name { color: var(--cyan); }
+.name-row .player-name .bot-name { color: var(--magenta); }
+.name-row .player-rating { color: var(--green); }
+.name-row .clock-time { margin-left: auto; font-family: ui-monospace, monospace; color: var(--white); }
+.name-row .clock-time.active { color: var(--green); }
+.name-row .clock-time.low { color: var(--red); }
+
+/* ---- impatience speech bubble (under Chess Amateur) ---- */
+.speech-bubble {
+  max-width: 480px; border: 2px solid var(--magenta); background: var(--black);
+  color: var(--magenta); padding: .4rem .6rem; margin: .2rem 0 .4rem; font-size: .85rem;
+}
 
 /* ---- board ---- */
 .board-wrap { width: 100%; max-width: 480px; }
@@ -113,10 +146,26 @@ a:hover { color: var(--white); }
 .coord.file { bottom: 1px; right: 2px; }
 
 /* ---- controls / panel ---- */
-.controls, .status-block, .movelog-block, .settings-block, .replay-block {
+.controls, .movelog-block, .replay-block, .popout {
   border: 2px solid var(--blue); background: var(--black);
   padding: .6rem; margin-bottom: .8rem;
 }
+.controls .toggle-row { display: flex; align-items: center; justify-content: space-between; margin: .4rem 0 .1rem; }
+.controls .toggle-row label { color: var(--white); }
+.controls .toggle-row input[type="checkbox"] { width: 1.1rem; height: 1.1rem; accent-color: var(--magenta); }
+
+/* ---- New Game popout ---- */
+.popout { border-color: var(--cyan); }
+.popout-actions { display: flex; gap: .5rem; margin-top: .4rem; }
+
+/* ---- network-error popout (cancellable overlay) ---- */
+.net-overlay[hidden] { display: none !important; }
+.net-overlay {
+  position: fixed; inset: 0; background: var(--black);
+  display: flex; align-items: center; justify-content: center; z-index: 60;
+}
+.net-box { border: 2px solid var(--red); background: var(--black); padding: 1rem; text-align: center; color: var(--red); max-width: 20rem; }
+.net-box p { margin: 0 0 .6rem; }
 legend, h2 { color: var(--cyan); }
 fieldset { border: 1px solid var(--green); }
 label { color: var(--white); }
@@ -140,19 +189,13 @@ input[type="number"] {
 .btn-danger:hover { background: var(--red); color: var(--black); }
 .btn-small { padding: .2rem .5rem; font-size: .85rem; }
 
-.turn-indicator { color: var(--white); font-weight: bold; }
-.message { color: var(--yellow); min-height: 1.2rem; margin-top: .3rem; }
-
 /* ---- move log ---- */
-.movelog { list-style: decimal; margin: 0; padding-left: 1.6rem; max-height: 240px; overflow-y: auto; color: var(--white); }
+.movelog { list-style: decimal; margin: 0; padding-left: 1.6rem; max-height: 320px; overflow-y: auto; color: var(--white); }
 .movelog .white-move { color: var(--white); }
 .movelog .black-move { color: var(--green); }
-
-/* ---- settings toggles ---- */
-.settings-block .toggle-row { display: flex; align-items: center; justify-content: space-between; margin: .3rem 0; }
-.settings-block label { color: var(--white); }
-.settings-block input[type="checkbox"] { width: 1.1rem; height: 1.1rem; accent-color: var(--magenta); }
-.settings-block .disabled-note { color: var(--red); font-size: .75rem; }
+.movelog .move-link { cursor: pointer; }
+.movelog .move-link:hover { color: var(--yellow); }
+.movelog .result-line { color: var(--yellow); font-weight: bold; margin-top: .4rem; }
 
 /* ---- replay controls ---- */
 .replay-block { display: none; }        /* shown only in replay mode */
@@ -166,11 +209,13 @@ input[type="number"] {
 .replay-controls button:disabled { color: var(--blue); border-color: var(--blue); cursor: default; }
 .replay-status { text-align: center; color: var(--cyan); margin-top: .3rem; }
 
-/* ---- banner (result) ---- */
-.banner { padding: .6rem; margin-top: .6rem; border: 2px solid var(--white); text-align: center; font-weight: bold; }
-.banner.win  { color: var(--green);   border-color: var(--green); }
-.banner.loss { color: var(--red);     border-color: var(--red); }
-.banner.draw { color: var(--yellow);  border-color: var(--yellow); }
+/* review Info disclosure (start/end time, in the transport container) */
+.review-info { margin-top: .4rem; text-align: center; }
+.review-info .disclosure-toggle { font-size: .75rem; }
+.review-info .disclosure-body { display: inline-block; text-align: left; }
+.review-info .info-row { font-size: .75rem; color: var(--white); margin: .15rem 0; }
+.review-info .info-label { color: var(--cyan); }
+.review-info .mono { font-family: ui-monospace, monospace; color: var(--green); }
 
 /* ---- promotion overlay ---- */
 /* The [hidden] attribute must win over display:flex, otherwise the overlay is
@@ -211,6 +256,29 @@ input[type="number"] {
 .tag-live { border-color: var(--green); color: var(--green); }
 .empty { text-align: center; color: var(--cyan); margin-top: 3rem; }
 
+/* ---- My Games sort + filter toolbar ---- */
+.history-toolbar {
+  display: flex; align-items: flex-start; gap: 1rem; flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.sort-control { color: var(--white); }
+.sort-control label { color: var(--cyan); margin-right: .4rem; }
+.sort-control select {
+  background: var(--black); color: var(--green); border: 1px solid var(--cyan);
+  font: inherit; padding: .2rem .3rem;
+}
+.filter-body { min-width: 16rem; }
+.filter-group {
+  border: 1px solid var(--green); margin: .4rem 0; padding: .3rem .5rem;
+}
+.filter-group legend { color: var(--cyan); font-size: .8rem; }
+.filter-group label { display: inline-block; margin-right: .6rem; color: var(--white); font-size: .8rem; }
+.filter-group input[type="text"], .filter-group input[type="date"] {
+  background: var(--black); color: var(--green); border: 1px solid var(--cyan); font: inherit;
+}
+.filter-sub { border-top: 1px solid var(--blue); margin-top: .3rem; padding-top: .3rem; }
+.filter-sub .sub-label { color: var(--yellow); font-size: .75rem; display: block; margin-bottom: .2rem; }
+
 /* ---- mode / time-control controls (8-color palette) ---- */
 .mode-choice, .tc-choice { border: 1px solid var(--green); margin-top: .5rem; }
 .mode-choice label, .tc-choice label { display: inline-block; margin-right: .5rem; }
@@ -221,10 +289,4 @@ input[type="number"] {
 .tc-inputs.disabled { opacity: 1; }          /* no opacity blends; hide instead */
 .tc-inputs[hidden] { display: none !important; }
 
-/* ---- clocks ---- */
-.clock-block { border: 2px solid var(--yellow); background: var(--black); padding: .5rem; margin-bottom: .8rem; }
-.clock { display: flex; justify-content: space-between; align-items: center; font-size: 1.3rem; padding: .2rem .3rem; color: var(--white); }
-.clock-label { color: var(--cyan); font-size: .9rem; }
-.clock-time { font-family: ui-monospace, monospace; color: var(--white); }
-.clock.active .clock-time { color: var(--green); }     /* side to move */
-.clock.low .clock-time { color: var(--red); }           /* under 10s */
+

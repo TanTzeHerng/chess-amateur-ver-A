@@ -39,6 +39,7 @@ import auth
 import ratings as R
 import timecontrol as TC
 import clockclient
+import eco
 from storage import Store
 
 app = Flask(__name__)
@@ -103,6 +104,15 @@ def _parse_time_control(data):
     return base, inc
 
 
+def _eco_for(moves_uci):
+    """Classify a game's move list to an ECO opening. Returns (code, name) or
+    (None, None) when nothing matches (too short / off-book)."""
+    hit = eco.classify(moves_uci)
+    if not hit:
+        return None, None
+    return hit.get("eco"), hit.get("name")
+
+
 def _apply_result_and_rating(user, mode, human_color, base_seconds, increment,
                              result):
     """Apply the rating change for a finished game and return the
@@ -125,16 +135,22 @@ def _apply_result_and_rating(user, mode, human_color, base_seconds, increment,
         opp = R.CHESS_AMATEUR_FIDE[tclass]
         new_rating, delta = R.elo_update(current, opp, score)
         STORE.update_fide_rating(user["id"], tclass, new_rating)
-        sign = "+" if delta >= 0 else ""
-        return "%s%.2f FIDE %s" % (sign, delta, tclass)
+        # Refresh the in-memory user dict so any post-update display_ratings()
+        # (in _move_extra / the resign+in-progress responses) reports the NEW
+        # rating, not the pre-game value the request read at start.
+        user["fide_%s" % tclass] = new_rating
+        return R.format_delta(delta, suffix="FIDE %s" % tclass)
 
     # rated (Glicko-2)
     new_r, new_rd, new_vol, delta = R.glicko2_update(
         user["rated_rating"], user["rated_rd"], user["rated_vol"],
         R.CHESS_AMATEUR_RATED, R.CHESS_AMATEUR_RATED_RD, score)
     STORE.update_rated_rating(user["id"], new_r, new_rd, new_vol)
-    sign = "+" if delta >= 0 else ""
-    return "%s%.2f" % (sign, delta)
+    # Refresh the in-memory user dict (see FIDE note above).
+    user["rated_rating"] = new_r
+    user["rated_rd"] = new_rd
+    user["rated_vol"] = new_vol
+    return R.format_delta(delta)
 
 
 # ==========================================================================
@@ -232,12 +248,14 @@ def api_me():
 # ==========================================================================
 
 def _persist_in_progress(user_id, gid, human_color, moves_uci, started_at,
-                         base_seconds=None, increment=0, clock=None):
+                         base_seconds=None, increment=0, clock=None,
+                         mode=None):
     """Create or update the single in-progress game row for a user.
 
     `clock` is the live {white, black} remaining seconds (or None for
     unlimited) so a resumed game continues with the correct times.
-    Returns the game id (existing or newly created).
+    `mode` (fide/rated/casual) is stored so the My Games Mode filter works for
+    ongoing games too. Returns the game id (existing or newly created).
     """
     cw = clock.get("white") if isinstance(clock, dict) else None
     cb = clock.get("black") if isinstance(clock, dict) else None
@@ -245,7 +263,7 @@ def _persist_in_progress(user_id, gid, human_color, moves_uci, started_at,
         user_id=user_id, game_id=gid, human_color=human_color,
         moves_uci=moves_uci, started_at=started_at,
         base_seconds=base_seconds, increment=increment,
-        clock_white=cw, clock_black=cb)
+        clock_white=cw, clock_black=cb, mode=mode)
 
 
 @app.post("/api/new")
@@ -310,8 +328,10 @@ def api_new():
         gid = _persist_in_progress(user["id"], None, human_color,
                                    moves_uci, started_at,
                                    base_seconds=base_seconds, increment=increment,
-                                   clock=clock)
+                                   clock=clock, mode=mode)
 
+    player_rating, bot_rating = R.display_ratings(
+        user, mode, base_seconds, increment)
     extra = {
         "started_at": started_at, "logged_in": bool(user),
         "in_progress": bool(user), "mode": mode,
@@ -319,6 +339,7 @@ def api_new():
         "unlimited": base_seconds is None,
         "clock": clock,
         "time_class": R.time_class(base_seconds, increment),
+        "player_rating": player_rating, "bot_rating": bot_rating,
     }
     return jsonify(core.state_dict(board, human_color, threads, san_history,
                                    moves_uci, game_id=gid,
@@ -370,6 +391,10 @@ def api_move():
             base_seconds = ip["base_seconds"]
             increment = ip["increment"]
             unlimited = base_seconds is None
+            # Authoritative mode from the persisted game (fall back to the
+            # request's parsed mode for rows written before mode was stored).
+            if ip.get("mode"):
+                mode = _parse_mode(ip["mode"])
 
     if board.is_game_over(claim_draw=True):
         return jsonify({"error": "game is over"}), 400
@@ -396,12 +421,14 @@ def api_move():
             if user:
                 rating_delta = _apply_result_and_rating(
                     user, mode, human_color, base_seconds, increment, result)
+                eco_code, eco_name = _eco_for(moves_uci)
                 STORE.finish_game(
                     user_id=user["id"], game_id=gid, human_color=human_color,
                     result=result, result_reason="time forfeit",
                     moves_uci=moves_uci, started_at=started_at,
                     ended_at=_now_iso(), base_seconds=base_seconds,
-                    increment=increment, rating_delta=rating_delta)
+                    increment=increment, rating_delta=rating_delta,
+                    eco_code=eco_code, eco_name=eco_name, mode=mode)
             extra = _move_extra(user, mode, base_seconds, increment, started_at,
                                 clock, in_progress=False, game_over=True,
                                 rating_delta=rating_delta,
@@ -444,12 +471,14 @@ def api_move():
                 if user:
                     rating_delta = _apply_result_and_rating(
                         user, mode, human_color, base_seconds, increment, result)
+                    eco_code, eco_name = _eco_for(moves_uci)
                     STORE.finish_game(
                         user_id=user["id"], game_id=gid, human_color=human_color,
                         result=result, result_reason="time forfeit",
                         moves_uci=moves_uci, started_at=started_at,
                         ended_at=_now_iso(), base_seconds=base_seconds,
-                        increment=increment, rating_delta=rating_delta)
+                        increment=increment, rating_delta=rating_delta,
+                        eco_code=eco_code, eco_name=eco_name, mode=mode)
                 extra = _move_extra(user, mode, base_seconds, increment,
                                     started_at, clock, in_progress=False,
                                     game_over=True, rating_delta=rating_delta,
@@ -478,17 +507,20 @@ def api_move():
             result = board.result(claim_draw=True)
             rating_delta = _apply_result_and_rating(
                 user, mode, human_color, base_seconds, increment, result)
+            eco_code, eco_name = _eco_for(moves_uci)
             STORE.finish_game(
                 user_id=user["id"], game_id=gid, human_color=human_color,
                 result=result, result_reason=core.result_reason(board),
                 moves_uci=moves_uci, started_at=started_at,
                 ended_at=_now_iso(), base_seconds=base_seconds,
-                increment=increment, rating_delta=rating_delta)
+                increment=increment, rating_delta=rating_delta,
+                eco_code=eco_code, eco_name=eco_name, mode=mode)
         else:
             gid = _persist_in_progress(user["id"], gid, human_color,
                                        moves_uci, started_at,
                                        base_seconds=base_seconds,
-                                       increment=increment, clock=clock)
+                                       increment=increment, clock=clock,
+                                       mode=mode)
 
     extra = _move_extra(user, mode, base_seconds, increment, started_at, clock,
                         in_progress=bool(user) and not game_over,
@@ -513,6 +545,8 @@ def _move_extra(user, mode, base_seconds, increment, started_at, clock,
     last), so the client sees game_over/result/result_reason correctly even
     though the board position itself is not checkmate/stalemate.
     """
+    player_rating, bot_rating = R.display_ratings(
+        user, mode, base_seconds, increment)
     extra = {
         "started_at": started_at, "logged_in": bool(user), "mode": mode,
         "base_seconds": base_seconds, "increment": increment,
@@ -520,6 +554,7 @@ def _move_extra(user, mode, base_seconds, increment, started_at, clock,
         "in_progress": in_progress,
         "time_class": R.time_class(base_seconds, increment),
         "rating_delta": rating_delta,
+        "player_rating": player_rating, "bot_rating": bot_rating,
     }
     if result is not None:
         extra["game_over"] = True
@@ -527,6 +562,10 @@ def _move_extra(user, mode, base_seconds, increment, started_at, clock,
         extra["result_reason"] = result_reason
         extra["status"] = "game_over"
         extra["legal_moves"] = []
+        # A clock (time-forfeit) ending is not a board game-over, so
+        # state_dict would compute result_line=None. Force the canonical
+        # winner-phrased tail here (e.g. '1-0 (White won on time)').
+        extra["result_line"] = core.result_line(result, result_reason)
     return extra
 
 
@@ -540,21 +579,32 @@ def api_resign():
     ip = STORE.get_in_progress_game(user["id"])
     if ip is None:
         return jsonify({"error": "No game in progress."}), 400
-    mode = _parse_mode(request.get_json(silent=True).get("mode")
-                       if request.get_json(silent=True) else None)
+    # Prefer the persisted game mode (authoritative); fall back to the request.
+    mode = _parse_mode(ip.get("mode") or (
+        request.get_json(silent=True).get("mode")
+        if request.get_json(silent=True) else None))
     result = _human_is_loser_result(ip["human_color"])
     rating_delta = _apply_result_and_rating(
         user, mode, ip["human_color"], ip["base_seconds"], ip["increment"],
         result)
+    eco_code, eco_name = _eco_for(ip["moves"])
     STORE.finish_game(
         user_id=user["id"], game_id=ip["id"], human_color=ip["human_color"],
         result=result, result_reason="resignation",
         moves_uci=ip["moves"], started_at=ip["started_at"],
         ended_at=_now_iso(), base_seconds=ip["base_seconds"],
-        increment=ip["increment"], rating_delta=rating_delta)
+        increment=ip["increment"], rating_delta=rating_delta,
+        eco_code=eco_code, eco_name=eco_name, mode=mode)
+    # _apply_result_and_rating refreshed `user` in place, so display_ratings
+    # now reports the POST-update player rating (with the delta shown alongside).
+    player_rating, bot_rating = R.display_ratings(
+        user, mode, ip["base_seconds"], ip["increment"])
     return jsonify({"ok": True, "result": result,
                     "result_reason": "resignation",
-                    "rating_delta": rating_delta})
+                    "rating_delta": rating_delta,
+                    "player_rating": player_rating, "bot_rating": bot_rating,
+                    "result_line": core.result_line(result, "resignation"),
+                    "eco_code": eco_code, "eco_name": eco_name})
 
 
 @app.post("/api/view")
@@ -574,9 +624,12 @@ def api_view():
     except core.InvalidMoveHistory:
         return jsonify({"error": "invalid move history"}), 400
     threads = core.coerce_threads(data.get("threads"))
+    eco_code, eco_name = _eco_for(moves_uci)
     return jsonify(core.state_dict(board, human_color, threads, san_history,
                                    moves_uci, game_id=data.get("game_id"),
-                                   last_bot_move=None))
+                                   last_bot_move=None,
+                                   extra={"eco_code": eco_code,
+                                          "eco_name": eco_name}))
 
 
 @app.get("/api/in-progress")
@@ -588,6 +641,11 @@ def api_in_progress():
     ip = STORE.get_in_progress_game(user["id"])
     if ip is None:
         return jsonify({"in_progress": None})
+    ip_mode = _parse_mode(ip.get("mode"))
+    # Include the ratings so a resumed FIDE/Rated game shows them next to the
+    # names immediately (Casual -> None,None, so the client shows nothing).
+    player_rating, bot_rating = R.display_ratings(
+        user, ip_mode, ip["base_seconds"], ip["increment"])
     return jsonify({"in_progress": {
         "id": ip["id"], "human_color": ip["human_color"],
         "moves": ip["moves"], "started_at": ip["started_at"],
@@ -595,6 +653,8 @@ def api_in_progress():
         "unlimited": ip["base_seconds"] is None,
         "time_class": R.time_class(ip["base_seconds"], ip["increment"]),
         "clock": ip.get("clock"),
+        "mode": ip.get("mode"),
+        "player_rating": player_rating, "bot_rating": bot_rating,
     }})
 
 

@@ -124,6 +124,9 @@ class Store:
                 " clock_white DOUBLE PRECISION,"  # live remaining seconds (NULL = unlimited)
                 " clock_black DOUBLE PRECISION,"
                 " rating_delta TEXT,"             # self-describing, e.g. '+1' or '+1 FIDE rapid'
+                " eco_code TEXT,"                 # ECO opening code, e.g. 'C60' (NULL if unknown)
+                " eco_name TEXT,"                 # ECO opening name, e.g. 'Ruy Lopez'
+                " mode TEXT,"                     # game mode: fide/rated/casual
                 " started_at TIMESTAMPTZ NOT NULL,"
                 " ended_at TIMESTAMPTZ,"
                 " created_at TIMESTAMPTZ NOT NULL DEFAULT now())"
@@ -162,6 +165,9 @@ class Store:
                 " clock_white REAL,"
                 " clock_black REAL,"
                 " rating_delta TEXT,"
+                " eco_code TEXT,"
+                " eco_name TEXT,"
+                " mode TEXT,"
                 " started_at TEXT NOT NULL,"
                 " ended_at TEXT,"
                 " created_at TEXT NOT NULL DEFAULT (datetime('now')))"
@@ -207,6 +213,12 @@ class Store:
             ("clock_white", "DOUBLE PRECISION", "REAL", None),
             ("clock_black", "DOUBLE PRECISION", "REAL", None),
             ("rating_delta", "TEXT", "TEXT", None),
+            ("eco_code", "TEXT", "TEXT", None),
+            ("eco_name", "TEXT", "TEXT", None),
+            # Game MODE (fide/rated/casual). Needed by the My Games Mode filter
+            # so both finished AND in-progress games can be filtered. NULL for
+            # pre-migration rows (treated as unknown/casual by the UI).
+            ("mode", "TEXT", "TEXT", None),
         ],
     }
 
@@ -347,7 +359,7 @@ class Store:
         ph = self._placeholder()
         row = self._execute(
             "SELECT id, human_color, moves, started_at, base_seconds, increment,"
-            " clock_white, clock_black"
+            " clock_white, clock_black, mode"
             " FROM games WHERE user_id = %s AND status = 'in_progress'"
             " ORDER BY id DESC LIMIT 1" % ph,
             (user_id,), fetch="one")
@@ -364,12 +376,14 @@ class Store:
             "base_seconds": (int(row[4]) if row[4] is not None else None),
             "increment": int(row[5]) if row[5] is not None else 0,
             "clock": clock,
+            "mode": row[8],
         }
 
     def upsert_in_progress_game(self, user_id, game_id, human_color,
                                 moves_uci, started_at,
                                 base_seconds=None, increment=0,
-                                clock_white=None, clock_black=None):
+                                clock_white=None, clock_black=None,
+                                mode=None):
         """Create or update the user's in-progress game (autosave).
 
         If game_id is given and belongs to the user, update its move list AND
@@ -397,12 +411,12 @@ class Store:
         # Insert path.
         sql = (
             "INSERT INTO games (user_id, human_color, status, moves, started_at,"
-            " base_seconds, increment, clock_white, clock_black)"
-            " VALUES (%s, %s, 'in_progress', %s, %s, %s, %s, %s, %s)"
-            % (ph, ph, ph, ph, ph, ph, ph, ph)
+            " base_seconds, increment, clock_white, clock_black, mode)"
+            " VALUES (%s, %s, 'in_progress', %s, %s, %s, %s, %s, %s, %s)"
+            % (ph, ph, ph, ph, ph, ph, ph, ph, ph)
         )
         params = (user_id, human_color, moves_str, started_at,
-                  base_seconds, increment, clock_white, clock_black)
+                  base_seconds, increment, clock_white, clock_black, mode)
         if self.backend == "postgres":
             row = self._execute(sql + " RETURNING id", params,
                                 fetch="one", commit=True)
@@ -417,22 +431,24 @@ class Store:
 
     def finish_game(self, user_id, game_id, human_color, result, result_reason,
                     moves_uci, started_at, ended_at,
-                    base_seconds=None, increment=0, rating_delta=None):
+                    base_seconds=None, increment=0, rating_delta=None,
+                    eco_code=None, eco_name=None, mode=None):
         """Finalize a game (real result or resignation): set status='finished',
-        the final move list, result, result_reason, and ended_at (to the
-        second). Works whether or not an in-progress row already exists.
-        Returns the game id."""
+        the final move list, result, result_reason, ended_at (to the second),
+        and the classified ECO opening (code + name). Works whether or not an
+        in-progress row already exists. Returns the game id."""
         ph = self._placeholder()
         moves_str = " ".join(moves_uci or [])
         # Try to finalize an existing in-progress row we own.
         if game_id is not None:
             self._execute(
                 "UPDATE games SET status = 'finished', moves = %s, result = %s,"
-                " result_reason = %s, ended_at = %s, rating_delta = %s"
+                " result_reason = %s, ended_at = %s, rating_delta = %s,"
+                " eco_code = %s, eco_name = %s, mode = %s"
                 " WHERE id = %s AND user_id = %s AND status = 'in_progress'"
-                % (ph, ph, ph, ph, ph, ph, ph),
+                % (ph, ph, ph, ph, ph, ph, ph, ph, ph, ph),
                 (moves_str, result, result_reason, ended_at, rating_delta,
-                 game_id, user_id),
+                 eco_code, eco_name, mode, game_id, user_id),
                 commit=True)
             check = self._execute(
                 "SELECT id FROM games WHERE id = %s AND user_id = %s"
@@ -444,12 +460,13 @@ class Store:
         sql = (
             "INSERT INTO games (user_id, human_color, status, result,"
             " result_reason, moves, started_at, ended_at, base_seconds,"
-            " increment, rating_delta)"
-            " VALUES (%s, %s, 'finished', %s, %s, %s, %s, %s, %s, %s, %s)"
-            % (ph, ph, ph, ph, ph, ph, ph, ph, ph, ph)
+            " increment, rating_delta, eco_code, eco_name, mode)"
+            " VALUES (%s, %s, 'finished', %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"
+            % (ph, ph, ph, ph, ph, ph, ph, ph, ph, ph, ph, ph, ph)
         )
         params = (user_id, human_color, result, result_reason, moves_str,
-                  started_at, ended_at, base_seconds, increment, rating_delta)
+                  started_at, ended_at, base_seconds, increment, rating_delta,
+                  eco_code, eco_name, mode)
         if self.backend == "postgres":
             row = self._execute(sql + " RETURNING id", params,
                                 fetch="one", commit=True)
@@ -467,7 +484,8 @@ class Store:
         ph = self._placeholder()
         rows = self._execute(
             "SELECT id, human_color, status, result, result_reason, moves,"
-            " started_at, ended_at, base_seconds, increment, rating_delta"
+            " started_at, ended_at, base_seconds, increment, rating_delta,"
+            " eco_code, eco_name, mode"
             " FROM games WHERE user_id = %s"
             " ORDER BY started_at DESC, id DESC" % ph,
             (user_id,), fetch="all") or []
@@ -478,7 +496,8 @@ class Store:
         ph = self._placeholder()
         row = self._execute(
             "SELECT id, human_color, status, result, result_reason, moves,"
-            " started_at, ended_at, base_seconds, increment, rating_delta"
+            " started_at, ended_at, base_seconds, increment, rating_delta,"
+            " eco_code, eco_name, mode"
             " FROM games WHERE user_id = %s AND id = %s" % (ph, ph),
             (user_id, game_id), fetch="one")
         if not row:
@@ -499,4 +518,10 @@ class Store:
             "base_seconds": (int(r[8]) if r[8] is not None else None),
             "increment": (int(r[9]) if r[9] is not None else 0),
             "rating_delta": r[10],
+            "eco_code": r[11],
+            "eco_name": r[12],
+            "mode": r[13],
+            # Convenience: start date only (YYYY-MM-DD) for the My Games "Date"
+            # column, derived from the full second-precision started_at.
+            "date": (str(r[6])[:10] if r[6] is not None else None),
         }

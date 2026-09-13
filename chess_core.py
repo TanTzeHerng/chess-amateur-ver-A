@@ -81,6 +81,70 @@ def result_reason(board):
     return None
 
 
+# -- canonical, winner-phrased result reason strings ----------------------
+#
+# The frontend shows a single human string for how a game ended. It is ALWAYS
+# phrased from the WINNER's color and ALWAYS uses "won" (never "lost"); draws
+# are phrased "Draw by ...". These are the AUTHORITATIVE strings from the spec.
+#
+# The winner's color is derived from the RESULT string ('1-0' -> White wins,
+# '0-1' -> Black wins). The internal `reason` codes (as emitted by
+# result_reason() below, plus 'resignation'/'time forfeit' set by app.py) are
+# mapped to the canonical wording. Raw code fields are preserved for storage;
+# this function produces the DISPLAY string only.
+
+def _winner_color(result):
+    """Winner color word ('White'/'Black') from a result string, else None."""
+    if result == "1-0":
+        return "White"
+    if result == "0-1":
+        return "Black"
+    return None
+
+
+def canonical_reason(result, reason):
+    """Map (result, internal reason code) to the canonical display string.
+
+    result: '1-0' / '0-1' / '1/2-1/2'. reason: one of the internal codes
+    ('checkmate', 'resignation', 'time forfeit'/'time', 'repetition',
+    'stalemate', 'insufficient material', 'fifty-move rule'). Returns the
+    winner-phrased string, or None if it cannot be determined.
+    """
+    winner = _winner_color(result)
+    code = (reason or "").lower()
+
+    # Winner-phrased decisive endings.
+    if code == "checkmate" and winner:
+        return "%s won by checkmate" % winner
+    if code == "resignation" and winner:
+        return "%s won by resignation" % winner
+    if code in ("time forfeit", "time", "on time") and winner:
+        return "%s won on time" % winner
+
+    # Draw endings (phrased "Draw by ...").
+    if code == "repetition":
+        return "Draw by 3-fold repetition"
+    if code == "stalemate":
+        return "Draw by stalemate"
+    if code == "insufficient material":
+        return "Draw by insufficient material"
+    if code == "fifty-move rule":
+        return "Draw by 50-move rule"
+    return None
+
+
+def result_line(result, reason):
+    """Move-log tail: '1-0' / '0-1' / '1/2-1/2' plus the canonical reason in
+    parentheses, e.g. '1-0 (White won by checkmate)'. If the reason cannot be
+    resolved, returns just the result string. Returns None without a result."""
+    if not result:
+        return None
+    reason_text = canonical_reason(result, reason)
+    if reason_text:
+        return "%s (%s)" % (result, reason_text)
+    return result
+
+
 def status_str(board):
     if board.is_game_over(claim_draw=True):
         return "game_over"
@@ -153,6 +217,7 @@ def state_dict(board, human_color, threads, san_history, moves_uci,
     """
     game_over = board.is_game_over(claim_draw=True)
     result = board.result(claim_draw=True) if game_over else None
+    reason = result_reason(board) if game_over else None
     out = {
         "game_id": game_id,
         "fen": board.fen(),
@@ -167,7 +232,9 @@ def state_dict(board, human_color, threads, san_history, moves_uci,
         "last_bot_move": last_bot_move,
         "game_over": game_over,
         "result": result,
-        "result_reason": result_reason(board) if game_over else None,
+        "result_reason": reason,
+        # Move-log tail ('1-0 (White won by checkmate)') when the game is over.
+        "result_line": result_line(result, reason) if game_over else None,
     }
     if extra:
         out.update(extra)

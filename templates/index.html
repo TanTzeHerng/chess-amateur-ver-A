@@ -10,14 +10,52 @@
   <header class="topbar">
     <h1>Play vs <span class="bot-name">{{ bot_name }}</span></h1>
     <nav class="account-nav" id="accountNav">
+      <!-- Settings disclosure (collapsed by default). Relocated here from the
+           panel; contains Animations, Sound effects and Advanced Settings. -->
+      <div class="disclosure" id="settingsTab">
+        <button type="button" class="disclosure-toggle" id="settingsToggle" aria-expanded="false">
+          Settings <span class="arrow">&#x25B8;</span>
+        </button>
+        <div class="disclosure-body" id="settingsBody" hidden>
+          <div class="toggle-row">
+            <label for="animToggle">Animations</label>
+            <input type="checkbox" id="animToggle" />
+          </div>
+          <div class="toggle-row">
+            <label for="soundToggle">Sound effects</label>
+            <input type="checkbox" id="soundToggle" />
+          </div>
+          <p class="disabled-note" id="soundNote" hidden>Sound needs animations on.</p>
+
+          <div class="disclosure" id="advancedTab">
+            <button type="button" class="disclosure-toggle" id="advancedToggle" aria-expanded="false">
+              Advanced Settings <span class="arrow">&#x25B8;</span>
+            </button>
+            <div class="disclosure-body" id="advancedBody" hidden>
+              <div class="threads-choice">
+                <label for="threads">Threads</label>
+                <input type="number" id="threads" name="threads" value="{{ default_threads }}" min="1" max="128" step="1" />
+                <p class="hint">Lower this on small servers (1&ndash;2).</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       {% if user %}
-        <span class="who">Signed in as <strong>{{ user.username }}</strong></span>
-        <a class="navlink" href="{{ url_for('history_page') }}">My games</a>
-        <button id="logoutBtn" type="button" class="navlink btnlink">Log out</button>
+      <!-- Profile disclosure (logged-in only): My games + Logout. -->
+      <div class="disclosure" id="profileTab">
+        <button type="button" class="disclosure-toggle" id="profileToggle" aria-expanded="false">
+          Profile <span class="arrow">&#x25B8;</span>
+        </button>
+        <div class="disclosure-body" id="profileBody" hidden>
+          <a class="navlink" href="{{ url_for('history_page') }}">My games</a>
+          <button id="logoutBtn" type="button" class="navlink btnlink">Logout</button>
+        </div>
+      </div>
       {% elif accounts_enabled %}
-        <a class="navlink" href="{{ url_for('login_page') }}">Log in</a>
         <a class="navlink" href="{{ url_for('register_page') }}">Sign up</a>
-        <span class="who">or playing as <strong>guest</strong></span>
+        <a class="navlink" href="{{ url_for('login_page') }}">Login</a>
       {% else %}
         <span class="who">Guest mode (accounts unavailable)</span>
       {% endif %}
@@ -26,20 +64,43 @@
 
   <main class="layout">
     <section class="board-area">
-      <div class="opponent-strip" id="opponentStrip">
-        <span class="opponent-label">Opponent: <span class="bot-name">{{ bot_name }}</span> <span class="threads-badge" id="threadsBadge"></span></span>
+      <!-- Top name row: Chess Amateur + rating + clock (tiny), above the board.
+           The impatience speech bubble hangs under this name. -->
+      <div class="name-row" id="nameRowTop">
+        <span class="player-name"><span class="bot-name">{{ bot_name }}</span></span>
+        <span class="player-rating" id="ratingTop" hidden></span>
+        <span class="clock-time" id="clockTopTime" hidden>--:--</span>
         <span class="thinking" id="thinking" hidden>{{ bot_name }} is thinking&hellip;</span>
       </div>
+      <div class="speech-bubble" id="speechBubble" hidden></div>
 
       <div class="board-wrap">
         <div id="board" class="board" role="grid" aria-label="Chess board"></div>
       </div>
 
-      <div class="banner" id="banner" hidden></div>
+      <!-- Bottom name row: the player's username + rating + clock (tiny). -->
+      <div class="name-row" id="nameRowBottom">
+        <span class="player-name" id="humanName">{% if user %}{{ user.username }}{% else %}Guest{% endif %}</span>
+        <span class="player-rating" id="ratingBottom" hidden></span>
+        <span class="clock-time" id="clockBottomTime" hidden>--:--</span>
+      </div>
     </section>
 
     <aside class="panel">
       <div class="controls">
+        <button id="newGame" type="button" class="btn">New Game</button>
+        <button id="resumeBtn" type="button" class="btn" hidden>Resume</button>
+        <button id="resignBtn" type="button" class="btn btn-danger" hidden>Resign</button>
+
+        <!-- Casual-only self-analysis toggle. -->
+        <div class="toggle-row" id="selfAnalysisRow" hidden>
+          <label for="selfAnalysisToggle">Self-analysis</label>
+          <input type="checkbox" id="selfAnalysisToggle" />
+        </div>
+      </div>
+
+      <!-- New Game popout: hidden until New Game is clicked. -->
+      <div class="popout" id="newGamePopout" hidden>
         <fieldset class="color-choice">
           <legend>Play as</legend>
           <label><input type="radio" name="color" value="white" checked /> White</label>
@@ -76,28 +137,15 @@
           </div>
         </fieldset>
 
-        <div class="threads-choice">
-          <label for="threads">Engine threads</label>
-          <input type="number" id="threads" name="threads" value="{{ default_threads }}" min="1" max="128" step="1" />
-          <p class="hint">Lower this on small servers (1&ndash;2).</p>
+        <div class="popout-actions">
+          <button id="startGame" type="button" class="btn">Start</button>
+          <button id="cancelNewGame" type="button" class="btn">Cancel</button>
         </div>
-        <button id="newGame" type="button" class="btn">New Game</button>
-        <button id="resignBtn" type="button" class="btn btn-danger" hidden>Resign</button>
       </div>
 
-      <div class="clock-block" id="clockBlock" hidden>
-        <div class="clock" id="clockTop"><span class="clock-label" id="clockTopLabel"></span> <span class="clock-time" id="clockTopTime">--:--</span></div>
-        <div class="clock" id="clockBottom"><span class="clock-label" id="clockBottomLabel"></span> <span class="clock-time" id="clockBottomTime">--:--</span></div>
-      </div>
-
-      <div class="status-block">
-        <div class="turn-indicator" id="turnIndicator">Loading&hellip;</div>
-        <div class="message" id="message" role="status" aria-live="polite"></div>
-      </div>
-
-      <!-- Replay controls: shown only when replaying a finished game. -->
+      <!-- Review controls: shown only when reviewing a finished game. -->
       <div class="replay-block" id="replayBlock">
-        <h2>Replay</h2>
+        <h2>Review</h2>
         <div class="replay-controls">
           <button id="replayFirst" type="button" title="First position">&#x23EE;</button>
           <button id="replayPrev"  type="button" title="Back one move">&#x25C0;</button>
@@ -106,23 +154,22 @@
           <button id="replayLast"  type="button" title="Last position">&#x23ED;</button>
         </div>
         <div class="replay-status" id="replayStatus"></div>
-      </div>
 
-      <div class="settings-block">
-        <h2>Settings</h2>
-        <div class="toggle-row">
-          <label for="animToggle">Animations</label>
-          <input type="checkbox" id="animToggle" />
+        <!-- Info disclosure (in the same container as the transport buttons):
+             a tiny arrow expanding to the reviewed game's start + end time to
+             the SECOND. Uses the [hidden] attribute for show/hide. -->
+        <div class="disclosure review-info" id="reviewInfoTab">
+          <button type="button" class="disclosure-toggle" id="reviewInfoToggle" aria-expanded="false">
+            Info <span class="arrow">&#x25B8;</span>
+          </button>
+          <div class="disclosure-body" id="reviewInfoBody" hidden>
+            <div class="info-row"><span class="info-label">Start</span> <span class="mono" id="reviewStart">&mdash;</span></div>
+            <div class="info-row"><span class="info-label">End</span> <span class="mono" id="reviewEnd">&mdash;</span></div>
+          </div>
         </div>
-        <div class="toggle-row">
-          <label for="soundToggle">Sound effects</label>
-          <input type="checkbox" id="soundToggle" />
-        </div>
-        <p class="disabled-note" id="soundNote" hidden>Sound needs animations on.</p>
       </div>
 
       <div class="movelog-block">
-        <h2>Move log</h2>
         <ol class="movelog" id="moveLog"></ol>
       </div>
     </aside>
@@ -136,6 +183,14 @@
     </div>
   </div>
 
+  <!-- Network-error popout (cancellable) -->
+  <div id="netErrorOverlay" class="net-overlay" hidden>
+    <div class="net-box">
+      <p id="netErrorText">A network error occurred. Please try again.</p>
+      <button id="netErrorClose" type="button" class="btn">Close</button>
+    </div>
+  </div>
+
   <!-- Flags for the frontend: whether a user is signed in (enables save/
        resume/resign + the one-active-game rule) and whether accounts exist. -->
   <script>
@@ -143,7 +198,8 @@
       botName: {{ bot_name | tojson }},
       loggedIn: {{ 'true' if user else 'false' }},
       accountsEnabled: {{ 'true' if accounts_enabled else 'false' }},
-      defaultThreads: {{ default_threads | tojson }}
+      defaultThreads: {{ default_threads | tojson }},
+      username: {{ (user.username if user else 'Guest') | tojson }}
     };
   </script>
   <script src="{{ url_for('static', filename='effects.js') }}"></script>
