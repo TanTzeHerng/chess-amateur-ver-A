@@ -173,20 +173,55 @@ separate server needs to be running.
 
 ## Deploying with Docker
 
-The repo ships a `Dockerfile` that downloads an official Stockfish release
-(linux/amd64) at build time and places it inside the image, so the container
-runs anywhere without a separate engine install. It uses a slim Python base and
+The repo ships a multi-stage `Dockerfile` that produces **two** Stockfish
+binaries at build time and places them inside the image, so the container runs
+anywhere without a separate engine install. It uses a slim Python base and
 installs only `python-chess`.
 
-The Dockerfile deliberately uses the **generic** `stockfish-ubuntu-x86-64`
-build rather than a CPU-optimized variant (AVX2/BMI2). The optimized builds use
-instructions that some cloud CPUs lack; on such a host the binary dies instantly
-with `SIGILL` on launch, the engine never starts, and a move request hangs until
-the platform proxy returns a `502` with nothing in the logs. The generic build
-runs on any 64-bit x86 CPU. Because Chess Amateur searches at depth 1, the
+- **`/usr/local/bin/stockfish`** &mdash; the engine the app actually uses
+  (`STOCKFISH_PATH` points here). It is **built from source** at tag `sf_17`
+  with a minimal Chess Amateur probe-instrumentation patch
+  (`stockfish-ca-probe.patch`, see below) applied to `src/search.cpp`.
+- **`/usr/local/bin/stockfish-prebuilt`** &mdash; a **pristine, unmodified**
+  official release binary, kept as a fallback.
+
+Both binaries are the **generic** `x86-64` build (compiled with `ARCH=x86-64`
+from source; the official `stockfish-ubuntu-x86-64` release for the prebuilt),
+never a CPU-optimized variant (AVX2/BMI2). The optimized builds use instructions
+that some cloud CPUs lack; on such a host the binary dies instantly with
+`SIGILL` on launch, the engine never starts, and a move request hangs until the
+platform proxy returns a `502` with nothing in the logs. The generic build runs
+on any 64-bit x86 CPU. Because Chess Amateur searches at depth 1, the
 CPU-optimization level does not affect move quality, so the generic build costs
-nothing. A strict build-time smoke test runs a real UCI handshake and fails the
-build if the binary cannot execute, so a broken engine is never shipped.
+nothing.
+
+#### The probe-instrumentation patch
+
+The patched engine emits a distinctive UCI line
+`info string CA_TB_ABOUT_TO_PROBE` **only** when it is about to probe the Syzygy
+tablebases for a position it is *searching* but the tablebase is not loaded or
+insufficient (i.e. `Tablebases::probe_wdl` returns `TB::ProbeState::FAIL` inside
+the "Step 5. Tablebases probe" block). The app reads the raw UCI stream and uses
+this marker to defer a bot move while the ~386 MB tablebase download is still in
+progress, then run a fresh search once the tablebases are ready. The patch is
+pure instrumentation: it fires only on `FAIL`, so it never spams when the
+tablebase is present, and it leaves the search-result path untouched, so play is
+identical to stock `sf_17`. The `.patch` file lives in the build context and is
+applied in the builder stage **only**; it is never copied into the runtime
+image (which contains just the compiled binaries, no source and no `.patch`).
+
+#### Build-time self-tests and the pristine fallback
+
+The builder stage runs strict self-tests on the freshly compiled patched binary:
+a real `uciok` UCI handshake, a normal depth-1 `bestmove`, confirmation that the
+`CA_TB_ABOUT_TO_PROBE` marker fires for a searched position whose tablebase is
+absent/insufficient, and confirmation that it does **not** fire for a full-board
+search or when the probe succeeds. If **all** checks pass, the patched binary
+becomes `/usr/local/bin/stockfish`. If any check fails, the build falls back to
+the pristine prebuilt release binary as `/usr/local/bin/stockfish` (just without
+the probe marker) so the image always ships a working engine. A final runtime
+smoke test re-runs the `uciok` handshake and fails the build if the shipped
+binary cannot execute, so a broken engine is never shipped.
 
 Build and run locally:
 
@@ -202,8 +237,41 @@ docker run -p 8000:8000 -e SF_THREADS=2 chess-amateur
 - `SF_THREADS` sets the default engine thread count in the container. On small
   hosts, keep it low (`1`&ndash;`2`). Regardless of thread count, the engine
   stays at depth 1, so Chess Amateur remains beatable.
-- `STOCKFISH_PATH` is preset to the bundled binary (`/usr/local/bin/stockfish`)
-  inside the image; you do not need to set it.
+- `STOCKFISH_PATH` is preset to the bundled **patched** binary
+  (`/usr/local/bin/stockfish`) inside the image; you do not need to set it. The
+  pristine unmodified fallback stays at `/usr/local/bin/stockfish-prebuilt`.
+
+### Tablebases (Syzygy 5-men WDL)
+
+At boot the app kicks off the ~386 MB 5-men WDL Syzygy download in a
+**background daemon thread** started at app import (via
+`syzygy.start_background_download()`), so gunicorn **binds the port
+immediately**. The container never blocks on the download before serving, which
+is why Render (and similar platforms) no longer report *"No open ports
+detected"* on startup. The old blocking `python -m syzygy` prelude has been
+removed from the Docker `CMD`.
+
+The files are written to `SYZYGY_DIR` (default `/tmp/syzygy`, an **ephemeral**
+path, not a paid persistent disk) and are guarded by a `.syzygy_complete` marker
+so a restart reuses an existing download. `/healthz` stays instant and **never**
+waits on the download. Set `SYZYGY_DISABLE=1` (or `SYZYGY_DIR=""`) to skip the
+download entirely.
+
+The frontend polls a server-wide progress endpoint (single worker, no auth):
+
+```
+GET /api/tablebase-status
+-> {"ready": bool, "downloaded": int, "total": int, "percent": int}
+```
+
+- `ready` is `true` once the download has finished (or immediately when
+  tablebases are disabled or a complete download already exists on disk).
+- `percent` is `100` exactly when `ready` is `true`; otherwise it is
+  `int(100 * downloaded / total)` clamped to `< 100` so it never claims to be
+  done early.
+- `total` reflects the number of files actually **attempted**; benign
+  name-order `404`s (e.g. `KNvKB` whose canonical twin is `KBvKN`) are skipped
+  but still counted, so the denominator stays honest.
 
 ### Picking a host
 

@@ -127,6 +127,16 @@ class ChessAmateurEngine:
         # Thread count currently applied to the live Stockfish process. We only
         # re-send "setoption name Threads" when the requested value changes.
         self._applied_threads = None
+        # SyzygyPath currently applied to the live Stockfish process (or None
+        # when none is set). While the background download runs, the Syzygy
+        # directory starts EMPTY (no SyzygyPath -> tbConfig.cardinality==0 ->
+        # the Step-5 probe path is inactive and the CA_TB_ABOUT_TO_PROBE marker
+        # can never fire). Once the dir holds >=1 .rtbw, we re-apply SyzygyPath
+        # on the SAME long-lived process (a plain 'setoption', NOT a respawn) so
+        # the probe path activates and the marker fires for searched
+        # sub-positions whose table is not yet downloaded. This preserves the
+        # single-process invariant (no second engine is ever spawned).
+        self._applied_syzygy_path = None
         self._lock = threading.Lock()
 
     # -- process lifecycle -------------------------------------------------
@@ -155,12 +165,44 @@ class ChessAmateurEngine:
         # Tablebases: after 'uciok' and BEFORE 'isready'/'readyok', point
         # Stockfish at the Syzygy directory when one is configured + populated.
         # WDL-only 5-men set; disabled/absent -> no command emitted.
+        applied_path = None
         for cmd in syzygy_setoption_commands():
             self._send(proc, cmd)
+            # Remember the value we applied so we can detect later that the
+            # download populated the dir and re-apply on the live process.
+            if cmd.startswith("setoption name SyzygyPath value "):
+                applied_path = cmd[len("setoption name SyzygyPath value "):]
         self._send(proc, "isready")
         self._read_until(proc, "readyok", timeout=HANDSHAKE_TIMEOUT)
         self._applied_threads = self.threads
+        self._applied_syzygy_path = applied_path
         return proc
+
+    def _apply_syzygy_path(self, proc):
+        """Re-apply SyzygyPath on the LIVE process if the configured dir became
+        populated (or changed) since the last handshake.
+
+        This is a plain UCI 'setoption' on the SAME process -- NOT a respawn --
+        so the single-process invariant is untouched. It lets the marker fire
+        during the background download: the dir starts empty (no path) and,
+        once it holds >=1 .rtbw, Stockfish is pointed at it so the Step-5 probe
+        path activates for searched positions whose table is still missing.
+        """
+        cmds = syzygy_setoption_commands()
+        desired = None
+        for cmd in cmds:
+            if cmd.startswith("setoption name SyzygyPath value "):
+                desired = cmd[len("setoption name SyzygyPath value "):]
+        if desired == self._applied_syzygy_path:
+            return
+        # Only ever ADD/UPDATE a path here (the download only grows the dir).
+        # If desired is None we leave the previously-applied path in place.
+        if desired is None:
+            return
+        self._send(proc, "setoption name SyzygyPath value %s" % desired)
+        self._send(proc, "isready")
+        self._read_until(proc, "readyok", timeout=HANDSHAKE_TIMEOUT)
+        self._applied_syzygy_path = desired
 
     def _apply_threads(self, proc, threads):
         """Re-apply the Threads UCI option only when it changes."""
@@ -181,6 +223,7 @@ class ChessAmateurEngine:
         # and the OS reclaims the old process's memory first.
         self._kill()
         self._applied_threads = None
+        self._applied_syzygy_path = None
         self._proc = self._spawn()
         return self._proc
 
@@ -256,6 +299,13 @@ class ChessAmateurEngine:
 
     # -- public API --------------------------------------------------------
 
+    # Distinctive UCI line the PATCHED Stockfish emits (FEAT-003) when it is
+    # ABOUT to probe a SEARCHED position but the tablebase is absent/insufficient
+    # (probe_wdl returned ProbeState::FAIL). We detect it during a search to
+    # drive the app-layer move deferral (FEAT-004). It is operator-only
+    # telemetry -- logged to server stdout, NEVER returned to the browser.
+    PROBE_MARKER = "CA_TB_ABOUT_TO_PROBE"
+
     def best_move(self, fen, threads=None):
         """Return Chess Amateur's move (UCI string) for the given FEN.
 
@@ -264,6 +314,23 @@ class ChessAmateurEngine:
         `threads` optionally overrides the Stockfish Threads option for this
         move (and stays applied until changed again). When omitted, the
         engine's default thread count is used. Depth is never affected.
+
+        This preserves the historic contract: callers that only want the move
+        get ONLY the move. The tablebase-probe signal is exposed separately via
+        best_move_with_probe_flag() so the browser-facing path is unchanged.
+        """
+        uci, _ = self.best_move_with_probe_flag(fen, threads=threads)
+        return uci
+
+    def best_move_with_probe_flag(self, fen, threads=None):
+        """Like best_move(), but also report whether the search emitted the
+        CA_TB_ABOUT_TO_PROBE marker.
+
+        Returns (uci, tb_probe_seen) where uci is the bestmove (or None) and
+        tb_probe_seen is True iff the patched engine signalled it was about to
+        probe a searched position whose tablebase is absent/insufficient. The
+        marker is NEVER included in the returned move and is NEVER sent to the
+        browser by callers -- it only informs the server-side deferral policy.
         """
         with self._lock:
             try:
@@ -285,6 +352,10 @@ class ChessAmateurEngine:
         proc = self._ensure_proc()
         if threads is not None:
             self._apply_threads(proc, int(threads))
+        # If the background download has populated the Syzygy dir since this
+        # process handshook, point the LIVE engine at it (setoption, no
+        # respawn) so the Step-5 probe path is active and the marker can fire.
+        self._apply_syzygy_path(proc)
         self._send(proc, "ucinewgame")
         self._send(proc, "isready")
         self._read_until(proc, "readyok", timeout=HANDSHAKE_TIMEOUT)
@@ -295,6 +366,7 @@ class ChessAmateurEngine:
 
         deadline = time.monotonic() + SEARCH_TIMEOUT
         bestmove = None
+        tb_probe_seen = False
         while True:
             line = self._readline_bounded(proc, deadline)
             line = line.strip()
@@ -305,6 +377,14 @@ class ChessAmateurEngine:
             # This is captured by the platform (e.g. Render) for the operator
             # only; it is never returned to the API/UI below.
             _uci_log(line)
+            # DEFERRAL SIGNAL (server-side only): the patched engine emits
+            # 'info string CA_TB_ABOUT_TO_PROBE' when it is about to probe a
+            # SEARCHED position whose tablebase is absent/insufficient. Record
+            # that the marker fired; it is logged above but NEVER returned to
+            # the browser -- only best_move_with_probe_flag()'s bool surfaces it
+            # to the app-layer deferral policy.
+            if self.PROBE_MARKER in line:
+                tb_probe_seen = True
             # PLAYER-FACING: only the bestmove is ever RETURNED. 'info' lines
             # (PV + eval) are logged above but never surfaced to the player.
             if line.startswith("bestmove"):
@@ -313,8 +393,8 @@ class ChessAmateurEngine:
                     bestmove = parts[1]
                 break
         if bestmove in (None, "(none)", "0000"):
-            return None
-        return bestmove
+            return None, tb_probe_seen
+        return bestmove, tb_probe_seen
 
     # -- shutdown ----------------------------------------------------------
 
@@ -332,6 +412,7 @@ class ChessAmateurEngine:
         # half-dead process as "current".
         self._proc = None
         self._applied_threads = None
+        self._applied_syzygy_path = None
         if proc is None:
             return
         try:

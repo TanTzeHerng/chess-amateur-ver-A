@@ -278,11 +278,14 @@
     </div>
   </div>
 
-  <!-- Network-error popout (cancellable) -->
-  <div id="netErrorOverlay" class="net-overlay" hidden>
-    <div class="net-box">
-      <p id="netErrorText">A network error occurred. Please try again.</p>
-      <button id="netErrorClose" type="button" class="btn">Close</button>
+  <!-- Popup-blocker fallback notice. The PRIMARY network-error and
+       tablebase-warming popups are REAL browser windows (window.open in
+       app.js). This minimal in-page notice (toggled via [hidden]) is shown
+       ONLY when a popup blocker prevents opening a real window. -->
+  <div id="netErrorFallback" class="net-fallback" hidden>
+    <div class="net-fallback-box">
+      <p id="netErrorFallbackText">A network error occurred. Please try again.</p>
+      <button id="netErrorFallbackClose" type="button" class="btn">Close</button>
     </div>
   </div>
 

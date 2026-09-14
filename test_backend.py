@@ -28,7 +28,9 @@ throwaway port in a background thread.
 """
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -1249,6 +1251,106 @@ def test_syzygy_download_disabled_is_noop():
     print("PASS syzygy download disabled -> no-op; 145 WDL signatures")
 
 
+def _reset_syzygy_progress(syzygy):
+    """Force syzygy's module-level progress counters back to their pristine
+    pre-download state so a test starts from a known baseline (offline)."""
+    with syzygy._PROGRESS_LOCK:
+        syzygy._downloaded = 0
+        syzygy._ready = False
+        syzygy._total = len(syzygy._wdl_filenames())
+        syzygy._progress_initialized = True
+
+
+def test_syzygy_status_disabled_reports_ready():
+    """FEAT-002 (a): syzygy.status() reports ready:true / percent:100 when
+    tablebases are disabled (SYZYGY_DISABLE), with no network touched."""
+    import syzygy
+    _reset_syzygy_progress(syzygy)
+    os.environ["SYZYGY_DISABLE"] = "1"
+    try:
+        st = syzygy.status()
+    finally:
+        del os.environ["SYZYGY_DISABLE"]
+    assert st["ready"] is True, st
+    assert st["percent"] == 100, st
+    assert st["downloaded"] == st["total"], st
+    assert st["total"] == 145, st
+    # start_background_download() is a no-op when disabled and keeps ready:true.
+    _reset_syzygy_progress(syzygy)
+    os.environ["SYZYGY_DISABLE"] = "1"
+    try:
+        assert syzygy.start_background_download() is None
+        assert syzygy.status()["ready"] is True
+    finally:
+        del os.environ["SYZYGY_DISABLE"]
+    print("PASS syzygy.status() disabled -> ready:true/percent:100; bg no-op")
+
+
+def test_syzygy_status_percent_monotonic_to_100():
+    """FEAT-002 (b): a simulated partial-then-complete progression yields a
+    monotonic percent that stays < 100 until ready, then reaches 100 with
+    ready:true. Drives the module-level counters directly (no network)."""
+    import syzygy
+    # Enabled but pointed at an empty temp dir so status() does not short-circuit
+    # via disabled/marker paths.
+    tmpdir = tempfile.mkdtemp(prefix="syzygy_prog_")
+    os.environ["SYZYGY_DIR"] = tmpdir
+    os.environ.pop("SYZYGY_DISABLE", None)
+    try:
+        _reset_syzygy_progress(syzygy)
+        total = syzygy.status()["total"]
+        assert total == 145, total
+        last = -1
+        # Drive a partial progression via the internal counter bump.
+        for _ in range(total):
+            syzygy._bump_downloaded()
+            st = syzygy.status()
+            assert st["percent"] >= last, ("percent regressed", last, st)
+            # Never claims 100 before ready is set, even when downloaded==total.
+            assert st["percent"] < 100, ("percent hit 100 before ready", st)
+            assert st["ready"] is False, st
+            last = st["percent"]
+        # Completing the routine flips ready:true and percent to exactly 100.
+        syzygy._mark_ready()
+        done = syzygy.status()
+        assert done["ready"] is True, done
+        assert done["percent"] == 100, done
+        assert done["downloaded"] == done["total"] == total, done
+    finally:
+        os.environ.pop("SYZYGY_DIR", None)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        _reset_syzygy_progress(syzygy)
+    print("PASS syzygy.status() percent monotonic, reaches 100 with ready:true")
+
+
+def test_flask_tablebase_status_endpoint():
+    """FEAT-002 (c): GET /api/tablebase-status returns the {ready, downloaded,
+    total, percent} shape via the in-process Flask test client."""
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    os.environ["SYZYGY_DISABLE"] = "1"
+    try:
+        import app as flask_app
+        client = flask_app.app.test_client()
+        r = client.get("/api/tablebase-status")
+        assert r.status_code == 200, r.get_json()
+        data = r.get_json()
+        assert set(data.keys()) == {"ready", "downloaded", "total", "percent"}, data
+        assert isinstance(data["ready"], bool), data
+        assert isinstance(data["downloaded"], int), data
+        assert isinstance(data["total"], int), data
+        assert isinstance(data["percent"], int), data
+        # Disabled -> ready:true / percent:100, and healthz stays independent.
+        assert data["ready"] is True, data
+        assert data["percent"] == 100, data
+        hr = client.get("/healthz")
+        assert hr.status_code == 200, hr.get_json()
+        assert hr.get_json()["status"] == "ok", hr.get_json()
+    finally:
+        os.environ.pop("SYZYGY_DISABLE", None)
+    print("PASS GET /api/tablebase-status shape + disabled values; healthz OK")
+
+
 def test_book_probe_offline_real_bin():
     """FEAT-005 (B): the Polyglot book (real pc2500.bin, offline) returns a
     legal book move for the start position and after 1.e4 e5 2.Nf3 Nc6, and
@@ -1328,6 +1430,359 @@ def test_reply_move_fide_prefers_book_others_do_not():
     finally:
         book.book_move = saved_book_move
         core.engine_move = saved_engine_move
+
+
+# ---------------------------------------------------------------------------
+# FEAT-004 (tablebase-warmup): engine probe-marker detection + app-layer move
+# DEFERRAL with ChessMimic clock preservation, and the resolution endpoint.
+# All OFFLINE: a fake shared engine emits the marker (or not), clockclient and
+# syzygy.status are monkeypatched. No real Stockfish, no real download.
+# ---------------------------------------------------------------------------
+
+class _FakeProbeEngine:
+    """Stand-in for the shared ChessAmateurEngine.
+
+    best_move_with_probe_flag() returns the FIRST legal move for the given FEN
+    and a caller-controlled tb_probe_seen flag, so tests can simulate the
+    patched Stockfish emitting CA_TB_ABOUT_TO_PROBE without spawning a process.
+    """
+
+    def __init__(self, probe_seen):
+        self.probe_seen = probe_seen
+        self.calls = 0
+
+    def best_move_with_probe_flag(self, fen, threads=None):
+        import chess as _chess
+        self.calls += 1
+        board = _chess.Board(fen)
+        mv = next(iter(board.legal_moves), None)
+        return (mv.uci() if mv is not None else None), self.probe_seen
+
+    # best_move must keep returning ONLY the move (browser-facing contract).
+    def best_move(self, fen, threads=None):
+        return self.best_move_with_probe_flag(fen, threads=threads)[0]
+
+
+def test_engine_probe_flag_never_leaks_move_only_contract():
+    """FEAT-004: best_move_with_probe_flag reports the marker; best_move still
+    returns ONLY the move (no marker text ever in the returned move)."""
+    import chess as _chess
+    import chess_core as core
+
+    saved = core.ENGINE
+    core.ENGINE = _FakeProbeEngine(probe_seen=True)
+    try:
+        b = _chess.Board()
+        # engine_move_ex surfaces the flag; engine_move stays (uci, san).
+        uci, san, seen = core.engine_move_ex(b.copy())
+        assert seen is True, "probe flag should be surfaced to the app layer"
+        assert uci and _chess.Move.from_uci(uci) in _chess.Board().legal_moves
+        assert ChessAmateurEngine.PROBE_MARKER not in (uci or ""), uci
+        # best_move (browser-facing) returns just the move, no flag.
+        mv = core.ENGINE.best_move(_chess.Board().fen())
+        assert ChessAmateurEngine.PROBE_MARKER not in mv, mv
+    finally:
+        core.ENGINE = saved
+    print("PASS engine probe flag surfaced to app; best_move stays move-only")
+
+
+_FIDE_USER_SEQ = [0]
+
+
+def test_engine_reapplies_syzygy_path_live_no_respawn():
+    """FEAT-004: while the download populates the Syzygy dir, the LIVE engine is
+    re-pointed at it via a plain 'setoption name SyzygyPath' (NOT a respawn), so
+    the Step-5 probe path activates and the marker can fire. Single-process
+    invariant preserved. Uses a recording fake proc -- no real Stockfish."""
+    import engine as eng_mod
+    import syzygy
+
+    sent = []
+
+    class _RecProc:
+        def __init__(self):
+            self._sf_buf = b""
+
+    eng = eng_mod.ChessAmateurEngine()
+    proc = _RecProc()
+
+    saved_send = eng_mod.ChessAmateurEngine.__dict__["_send"]
+    saved_read = eng_mod.ChessAmateurEngine.__dict__["_read_until"]
+    saved_dir = syzygy.syzygy_dir
+    # Patch I/O so no real process is needed.
+    eng_mod.ChessAmateurEngine._send = staticmethod(lambda p, line: sent.append(line))
+    eng_mod.ChessAmateurEngine._read_until = lambda self, p, prefix, timeout: prefix
+
+    tmpdir = tempfile.mkdtemp(prefix="syzygy_live_")
+    try:
+        # 1) Dir empty at "spawn" -> no SyzygyPath applied.
+        syzygy.syzygy_dir = lambda: None
+        eng._applied_syzygy_path = None
+        eng._apply_syzygy_path(proc)
+        assert not any("SyzygyPath" in s for s in sent), sent
+        assert eng._applied_syzygy_path is None
+
+        # 2) Download populates the dir -> live setoption (no respawn).
+        syzygy.syzygy_dir = lambda: tmpdir
+        eng._apply_syzygy_path(proc)
+        assert ("setoption name SyzygyPath value %s" % tmpdir) in sent, sent
+        assert eng._applied_syzygy_path == tmpdir
+        # No new process was created (respawn would go through _spawn/Popen).
+        assert eng._proc is None, "no engine process should have been spawned"
+
+        # 3) Idempotent: unchanged dir does not re-send the option.
+        before = list(sent)
+        eng._apply_syzygy_path(proc)
+        assert sent == before, ("should not re-apply unchanged SyzygyPath", sent)
+    finally:
+        eng_mod.ChessAmateurEngine._send = staticmethod(saved_send)
+        eng_mod.ChessAmateurEngine._read_until = saved_read
+        syzygy.syzygy_dir = saved_dir
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    print("PASS engine re-applies SyzygyPath live (setoption, no respawn) once dir populated")
+
+
+def _register_fide_user(client, username=None):
+    """Register + log in a UNIQUE user via the bcrypt path (no Supabase, no
+    network). The username is made unique per call because the in-process app's
+    DB/state may persist across tests in one run."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    if username is None:
+        _FIDE_USER_SEQ[0] += 1
+        username = "tbuser%d" % _FIDE_USER_SEQ[0]
+    r = client.post("/api/register", json={"username": username,
+                                           "password": "pw12345678"})
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+
+def _fide_move_env(monkeypatched_ready, bot_think, probe_seen):
+    """Set up app + a fide user + monkeypatch engine/clock/syzygy for a move.
+
+    Returns (flask_app, client, restore) where restore() undoes the patches.
+    Forces the engine path (book_move -> None) so the deferral logic (which
+    only applies to engine moves) is exercised deterministically.
+    """
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    os.environ.pop("SYZYGY_DISABLE", None)
+    import app as flask_app
+    import chess_core as core
+    import book
+    import clockclient
+    import syzygy
+
+    client = flask_app.app.test_client()
+    _register_fide_user(client)
+
+    saved = {
+        "engine": core.ENGINE,
+        "book_move": book.book_move,
+        "thinking_time": clockclient.thinking_time,
+        "status": syzygy.status,
+    }
+    core.ENGINE = _FakeProbeEngine(probe_seen=probe_seen)
+    book.book_move = lambda board, rng=None: None  # force engine path
+    clockclient.thinking_time = (
+        lambda fen, moves, base, inc, botc, oppc: bot_think)
+    syzygy.status = lambda: {"ready": monkeypatched_ready,
+                             "downloaded": 0 if not monkeypatched_ready else 145,
+                             "total": 145,
+                             "percent": 100 if monkeypatched_ready else 0}
+
+    def restore():
+        core.ENGINE = saved["engine"]
+        book.book_move = saved["book_move"]
+        clockclient.thinking_time = saved["thinking_time"]
+        syzygy.status = saved["status"]
+
+    return flask_app, client, restore
+
+
+def test_fide_move_defers_when_probe_and_not_ready():
+    """FEAT-004 (a) DEFERRAL: marker fired + syzygy not ready -> /api/move
+    returns last_bot_move=None + tb_warming:true, and the bot clock is
+    decremented by EXACTLY the mocked ChessMimic bot_think (wait NOT charged)."""
+    import chess as _chess
+    bot_think = 7.0
+    base, inc = 180.0, 2.0
+    flask_app, client, restore = _fide_move_env(
+        monkeypatched_ready=False, bot_think=bot_think, probe_seen=True)
+    try:
+        clock = {"white": base, "black": base}
+        r = client.post("/api/move", json={
+            "move": "e2e4", "moves": [], "human_color": "white",
+            "mode": "fide", "base_seconds": base, "increment": inc,
+            "clock": clock, "elapsed": 0.0,
+        })
+        assert r.status_code == 200, r.get_data(as_text=True)
+        d = r.get_json()
+        # Deferred: no bot move pushed, warming flag set, bot_think reported.
+        assert d["last_bot_move"] is None, d
+        assert d["tb_warming"] is True, d
+        assert abs(d["bot_think"] - bot_think) < 1e-9, d
+        # Only the human ply is in history (bot move pending).
+        assert d["moves"] == ["e2e4"], d["moves"]
+        assert d["san_history"] == ["e4"], d["san_history"]
+        # Bot clock charged EXACTLY bot_think (plus increment); wait not charged.
+        bot_clock = d["clock"]["black"]
+        assert abs(bot_clock - (base - bot_think + inc)) < 1e-9, (bot_clock, d)
+    finally:
+        restore()
+    print("PASS FIDE defers on probe+not-ready: no bot move, tb_warming, bot clock == base-think+inc")
+
+
+def test_fide_deferred_clock_equals_normal_clock_same_think():
+    """FEAT-004 (b) CLOCK-PRESERVATION EQUIVALENCE: the bot clock after a
+    DEFERRED move equals the bot clock after a NORMAL move for the same
+    think-time (the download wait is never charged)."""
+    bot_think = 5.5
+    base, inc = 300.0, 3.0
+
+    # Deferred path (not ready, marker fired).
+    flask_app, client, restore = _fide_move_env(
+        monkeypatched_ready=False, bot_think=bot_think, probe_seen=True)
+    try:
+        rd = client.post("/api/move", json={
+            "move": "e2e4", "moves": [], "human_color": "white", "mode": "fide",
+            "base_seconds": base, "increment": inc,
+            "clock": {"white": base, "black": base}, "elapsed": 0.0,
+        }).get_json()
+    finally:
+        restore()
+    deferred_bot_clock = rd["clock"]["black"]
+
+    # Normal path (ready, no marker) -- same think-time.
+    flask_app, client, restore = _fide_move_env(
+        monkeypatched_ready=True, bot_think=bot_think, probe_seen=False)
+    try:
+        rn = client.post("/api/move", json={
+            "move": "e2e4", "moves": [], "human_color": "white", "mode": "fide",
+            "base_seconds": base, "increment": inc,
+            "clock": {"white": base, "black": base}, "elapsed": 0.0,
+        }).get_json()
+    finally:
+        restore()
+    normal_bot_clock = rn["clock"]["black"]
+
+    assert rd["last_bot_move"] is None and rd["tb_warming"] is True, rd
+    assert rn["last_bot_move"] is not None and rn["tb_warming"] is False, rn
+    assert abs(deferred_bot_clock - normal_bot_clock) < 1e-9, (
+        deferred_bot_clock, normal_bot_clock)
+    print("PASS deferred bot clock == normal bot clock for same think-time (wait not charged)")
+
+
+def test_fide_resolution_fresh_search_when_ready_charges_no_extra():
+    """FEAT-004 (c) RESOLUTION: after a deferral, /api/resolve-bot-move with
+    syzygy ready runs a FRESH search, returns a real bestmove, and charges NO
+    extra think-time (bot_think already applied by the deferring move)."""
+    import chess as _chess
+    bot_think = 4.0
+    base, inc = 120.0, 1.0
+
+    # 1) Deferring move (not ready): capture the carried state + charged clock.
+    flask_app, client, restore = _fide_move_env(
+        monkeypatched_ready=False, bot_think=bot_think, probe_seen=True)
+    try:
+        d = client.post("/api/move", json={
+            "move": "e2e4", "moves": [], "human_color": "white", "mode": "fide",
+            "base_seconds": base, "increment": inc,
+            "clock": {"white": base, "black": base}, "elapsed": 0.0,
+        }).get_json()
+        assert d["tb_warming"] is True and d["last_bot_move"] is None, d
+        carried_moves = d["moves"]
+        carried_clock = d["clock"]
+        bot_clock_after_defer = carried_clock["black"]
+
+        # 2) Still warming -> resolve endpoint keeps it pending (no move yet).
+        import syzygy
+        r_pending = client.post("/api/resolve-bot-move", json={
+            "moves": carried_moves, "human_color": "white", "mode": "fide",
+            "base_seconds": base, "increment": inc, "clock": carried_clock,
+        }).get_json()
+        assert r_pending["last_bot_move"] is None, r_pending
+        assert r_pending["tb_warming"] is True, r_pending
+        # Clock untouched while still warming.
+        assert abs(r_pending["clock"]["black"] - bot_clock_after_defer) < 1e-9
+
+        # 3) Flip syzygy to ready -> fresh search resolves the bot move.
+        syzygy.status = lambda: {"ready": True, "downloaded": 145,
+                                 "total": 145, "percent": 100}
+        r = client.post("/api/resolve-bot-move", json={
+            "moves": carried_moves, "human_color": "white", "mode": "fide",
+            "base_seconds": base, "increment": inc, "clock": carried_clock,
+        }).get_json()
+    finally:
+        restore()
+
+    assert r["last_bot_move"] is not None, r
+    assert r["tb_warming"] is False, r
+    # A real bestmove was appended (fresh search) and is legal.
+    assert len(r["moves"]) == 2, r["moves"]
+    b = _chess.Board()
+    for u in r["moves"]:
+        mv = _chess.Move.from_uci(u)
+        assert mv in b.legal_moves, (u, r["moves"])
+        b.push(mv)
+    # NO extra think-time charged by resolution: the bot clock is unchanged
+    # from the deferring move's charged value.
+    assert abs(r["clock"]["black"] - bot_clock_after_defer) < 1e-9, (
+        r["clock"]["black"], bot_clock_after_defer)
+    print("PASS resolution: fresh search when ready, real bestmove, no extra think-time")
+
+
+def test_fide_move_no_defer_when_probe_but_ready():
+    """FEAT-004 (d) UNAFFECTED: marker fired but syzygy READY -> normal move
+    (no deferral); bot moves and is charged the ChessMimic think-time."""
+    bot_think = 3.0
+    base, inc = 180.0, 2.0
+    flask_app, client, restore = _fide_move_env(
+        monkeypatched_ready=True, bot_think=bot_think, probe_seen=True)
+    try:
+        d = client.post("/api/move", json={
+            "move": "e2e4", "moves": [], "human_color": "white", "mode": "fide",
+            "base_seconds": base, "increment": inc,
+            "clock": {"white": base, "black": base}, "elapsed": 0.0,
+        }).get_json()
+    finally:
+        restore()
+    assert d["last_bot_move"] is not None, d
+    assert d["tb_warming"] is False, d
+    assert len(d["moves"]) == 2, d["moves"]
+    assert abs(d["clock"]["black"] - (base - bot_think + inc)) < 1e-9, d
+    print("PASS FIDE ready+probe -> normal move (no deferral), bot charged think-time")
+
+
+def test_casual_move_unaffected_by_probe_marker():
+    """FEAT-004 (d) UNAFFECTED: a casual (no-clock) move never defers even if
+    the engine reports the probe marker -- casual has no clock model."""
+    import chess as _chess
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    os.environ.pop("SYZYGY_DISABLE", None)
+    import app as flask_app
+    import chess_core as core
+    import syzygy
+
+    client = flask_app.app.test_client()
+    saved_engine = core.ENGINE
+    saved_status = syzygy.status
+    core.ENGINE = _FakeProbeEngine(probe_seen=True)
+    syzygy.status = lambda: {"ready": False, "downloaded": 0,
+                             "total": 145, "percent": 0}
+    try:
+        d = client.post("/api/move", json={
+            "move": "e2e4", "moves": [], "human_color": "white",
+            "mode": "casual",
+        }).get_json()
+    finally:
+        core.ENGINE = saved_engine
+        syzygy.status = saved_status
+    # Casual: bot moves normally (instant), no tb_warming, no clock model.
+    assert d["last_bot_move"] is not None, d
+    assert d.get("tb_warming") is False, d
+    assert len(d["moves"]) == 2, d["moves"]
+    print("PASS casual move unaffected by probe marker (no deferral, moves instantly)")
 
 
 def test_flask_custom_position_casual():
@@ -2217,8 +2672,21 @@ def main():
     # FEAT-005: Syzygy setoption/download, Polyglot book, custom position.
     test_syzygy_setoption_command_sequence()
     test_syzygy_download_disabled_is_noop()
+    # FEAT-002 (tablebase-warmup): global status()/progress + endpoint.
+    test_syzygy_status_disabled_reports_ready()
+    test_syzygy_status_percent_monotonic_to_100()
+    test_flask_tablebase_status_endpoint()
     test_book_probe_offline_real_bin()
     test_reply_move_fide_prefers_book_others_do_not()
+    # FEAT-004 (tablebase-warmup): probe-marker detection + deferral + clock
+    # preservation + resolution endpoint (all offline, injected fakes).
+    test_engine_probe_flag_never_leaks_move_only_contract()
+    test_engine_reapplies_syzygy_path_live_no_respawn()
+    test_fide_move_defers_when_probe_and_not_ready()
+    test_fide_deferred_clock_equals_normal_clock_same_think()
+    test_fide_resolution_fresh_search_when_ready_charges_no_extra()
+    test_fide_move_no_defer_when_probe_but_ready()
+    test_casual_move_unaffected_by_probe_marker()
     test_flask_custom_position_casual()
     test_flask_custom_position_bot_moves_first_when_on_move()
     test_storage_start_fen_roundtrip()

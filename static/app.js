@@ -88,10 +88,12 @@ const dashboardEmpty = document.getElementById("dashboardEmpty");
 const animToggle = document.getElementById("animToggle");
 const soundToggle = document.getElementById("soundToggle");
 const soundNote = document.getElementById("soundNote");
-// network error popout
-const netErrorOverlay = document.getElementById("netErrorOverlay");
-const netErrorText = document.getElementById("netErrorText");
-const netErrorClose = document.getElementById("netErrorClose");
+// network error popout: the primary path is a REAL browser window (window.open).
+// #netErrorFallback is a minimal in-page notice used ONLY when a popup blocker
+// prevents opening the real window (window.open returns null).
+const netErrorFallback = document.getElementById("netErrorFallback");
+const netErrorFallbackText = document.getElementById("netErrorFallbackText");
+const netErrorFallbackClose = document.getElementById("netErrorFallbackClose");
 // replay/review controls
 const replayBlock = document.getElementById("replayBlock");
 const replayStatus = document.getElementById("replayStatus");
@@ -574,6 +576,19 @@ async function sendMove(uci, fromSq, toSq) {
       const botUci = next.last_bot_move ? next.last_bot_move.uci : null;
 
       playHumanMoveSound(next, botUci);
+
+      // The bot move was DEFERRED because the engine's search was about to probe
+      // a not-yet-downloaded tablebase (FEAT-004). The human move is applied and
+      // the bot's ChessMimic think-time is already charged; the move itself is
+      // pending. Adopt the (bot-pending) state, then open the REAL warming-up
+      // window and poll until the tablebases are ready and the move resolves.
+      const tbWarmingFlag = !!next.tb_warming;
+      if (!botUci && tbWarmingFlag) {
+        adoptState(next);
+        renderAll();
+        beginTablebaseWarming(next);
+        return;   // setBusy stays true until the deferred move resolves
+      }
 
       const botThink = (typeof next.bot_think === "number") ? next.bot_think : 0;
 
@@ -1238,15 +1253,214 @@ async function selfAnalysisMove(uci, fromSq, toSq) {
 }
 
 // =========================================================================
-// Network-error popout (cancellable)
+// Real-window popups (cancellable). Both the network-error popout and the
+// "tablebases are warming up" notice are REAL browser windows opened with
+// window.open(...) whose DOM we build ourselves. All styling uses the strict
+// 8-color palette (each RGB channel exactly 0 or 255; no rgba/opacity/gradient/
+// hsl/greys). If window.open is blocked by a popup blocker it returns null; in
+// that case we fall back to a minimal in-page notice toggled via [hidden].
 // =========================================================================
+
+// Shared <style> block for the real windows. Only the 8 palette colors appear
+// here: black #000000, white #ffffff, red #ff0000, green #00ff00,
+// blue #0000ff, yellow #ffff00, cyan #00ffff, magenta #ff00ff.
+const POPUP_STYLE = [
+  "html,body{margin:0;padding:0;background:#000000;color:#ffffff;",
+  "font-family:monospace;font-size:16px;}",
+  "body{padding:16px;}",
+  "h1{font-size:18px;margin:0 0 12px;color:#ffff00;}",
+  "p{margin:0 0 12px;line-height:1.4;}",
+  ".ca-err{color:#ff0000;}",
+  "button{font-family:monospace;font-size:16px;color:#ffffff;background:#000000;",
+  "border:2px solid #ffffff;padding:6px 14px;cursor:pointer;}",
+  "button:hover{color:#000000;background:#ffffff;}",
+  // Loading bar: white track, cyan fill (both fully saturated palette colors).
+  ".ca-track{border:2px solid #ffffff;background:#000000;height:24px;width:100%;}",
+  ".ca-fill{background:#00ffff;height:100%;width:0%;}",
+  ".ca-label{margin-top:8px;color:#00ffff;}"
+].join("");
+
+// ---- Network-error popout (cancellable REAL window) --------------------
+let netErrorWin = null;
 function showNetworkError(text) {
-  if (!netErrorOverlay) return;
-  if (netErrorText) netErrorText.textContent = text || "A network error occurred. Please try again.";
-  netErrorOverlay.hidden = false;
+  const msg = text || "A network error occurred. Please try again.";
+  // PRIMARY path: a real, cancellable browser window.
+  let win = null;
+  try {
+    win = window.open("", "caNetError", "width=380,height=200");
+  } catch (e) { win = null; }
+  if (win) {
+    netErrorWin = win;
+    const doc = win.document;
+    doc.open();
+    doc.write(
+      "<!doctype html><html><head><meta charset='utf-8'>" +
+      "<title>Network error</title><style>" + POPUP_STYLE + "</style></head>" +
+      "<body><h1 class='ca-err'>Network error</h1>" +
+      "<p class='ca-err' id='msg'></p>" +
+      "<button type='button' id='close'>Close</button></body></html>"
+    );
+    doc.close();
+    // textContent (not innerHTML) so the message is never interpreted as markup.
+    const msgEl = doc.getElementById("msg");
+    if (msgEl) msgEl.textContent = msg;
+    const btn = doc.getElementById("close");
+    if (btn) btn.addEventListener("click", () => { try { win.close(); } catch (e) {} });
+    return;
+  }
+  // FALLBACK (popup blocked): show the minimal in-page [hidden] notice instead.
+  if (netErrorFallback) {
+    if (netErrorFallbackText) netErrorFallbackText.textContent = msg;
+    netErrorFallback.hidden = false;
+  }
 }
 function hideNetworkError() {
-  if (netErrorOverlay) netErrorOverlay.hidden = true;
+  if (netErrorWin) { try { netErrorWin.close(); } catch (e) {} netErrorWin = null; }
+  if (netErrorFallback) netErrorFallback.hidden = true;
+}
+
+// ---- Tablebase "warming up" popout (REAL window) -----------------------
+// Opened ONLY when a bot move is DEFERRED because the engine's search was about
+// to probe a not-yet-downloaded tablebase (FEAT-004 tb_warming flag with
+// last_bot_move == null). This is a GLOBAL, server-wide warming-up state (not
+// per-user) and it must NEVER open on plain page load or for normal moves.
+let tbWarmWin = null;         // the real window (or null when using fallback)
+let tbWarmPollTimer = null;   // setTimeout handle for the ~1s status poll
+let tbWarming = false;        // guards against opening twice concurrently
+
+function openWarmingWindow() {
+  // PRIMARY path: a real browser window with a live loading bar.
+  let win = null;
+  try {
+    win = window.open("", "caTbWarming", "width=420,height=240");
+  } catch (e) { win = null; }
+  if (win) {
+    tbWarmWin = win;
+    const doc = win.document;
+    doc.open();
+    doc.write(
+      "<!doctype html><html><head><meta charset='utf-8'>" +
+      "<title>Tablebases loading</title><style>" + POPUP_STYLE + "</style></head>" +
+      "<body><h1>Tablebases not installed yet</h1>" +
+      "<p>Chess Amateur does not have the endgame tablebases installed yet. " +
+      "They are downloading now; your move will play as soon as they are ready.</p>" +
+      "<div class='ca-track'><div class='ca-fill' id='fill'></div></div>" +
+      "<div class='ca-label' id='label'>0%</div></body></html>"
+    );
+    doc.close();
+    return;
+  }
+  // FALLBACK (popup blocked): reuse the in-page network-error fallback notice so
+  // the user still learns the state via a palette-compliant [hidden] element.
+  tbWarmWin = null;
+  if (netErrorFallback) {
+    if (netErrorFallbackText) {
+      netErrorFallbackText.textContent =
+        "Chess Amateur does not have the endgame tablebases installed yet. " +
+        "Downloading\u2026 your move will play as soon as they are ready.";
+    }
+    netErrorFallback.hidden = false;
+  }
+}
+
+// Reflect a /api/tablebase-status payload into the warming window's loading bar.
+function updateWarmingWindow(status) {
+  const percent = status && status.ready ? 100
+    : Math.max(0, Math.min(100, Math.round((status && status.percent) || 0)));
+  if (tbWarmWin && !tbWarmWin.closed) {
+    try {
+      const doc = tbWarmWin.document;
+      const fill = doc.getElementById("fill");
+      const label = doc.getElementById("label");
+      if (fill) fill.style.width = percent + "%";
+      if (label) label.textContent = percent + "%";
+    } catch (e) { /* window may be mid-navigation; ignore */ }
+  } else if (netErrorFallback && !netErrorFallback.hidden && netErrorFallbackText) {
+    netErrorFallbackText.textContent =
+      "Chess Amateur does not have the endgame tablebases installed yet. " +
+      "Downloading (" + percent + "%)\u2026 your move will play as soon as it is ready.";
+  }
+}
+
+function closeWarmingWindow() {
+  if (tbWarmPollTimer) { clearTimeout(tbWarmPollTimer); tbWarmPollTimer = null; }
+  if (tbWarmWin) { try { tbWarmWin.close(); } catch (e) {} tbWarmWin = null; }
+  // Only hide the shared fallback notice if it was serving the warming message
+  // (it is also used for network errors, which manage their own lifecycle).
+  if (netErrorFallback && !netErrorWin) netErrorFallback.hidden = true;
+  tbWarming = false;
+}
+
+// Poll GET /api/tablebase-status (~every 1s). When ready, resolve the deferred
+// bot move via POST /api/resolve-bot-move and reveal it exactly like a normal
+// bot reply. Poll defensively: if the user closed the real window, stop.
+function pollWarmingStatus(deferred) {
+  const step = async () => {
+    // If the user closed the real popup, stop polling and release the game.
+    if (tbWarmWin && tbWarmWin.closed) { closeWarmingWindow(); setBusy(false); return; }
+    let status = null;
+    try {
+      const res = await fetch("/api/tablebase-status");
+      if (res.ok) status = await res.json();
+    } catch (e) { /* transient; try again next tick */ }
+    if (status) updateWarmingWindow(status);
+    if (status && status.ready) {
+      await resolveDeferredBotMove(deferred);
+      return;
+    }
+    tbWarmPollTimer = setTimeout(step, 1000);
+  };
+  tbWarmPollTimer = setTimeout(step, 1000);
+}
+
+// Ask the server for the deferred bot move (fresh search now that TB is ready),
+// then reveal it through the normal path and finalize the warming window.
+async function resolveDeferredBotMove(deferred) {
+  let next = null;
+  try {
+    const res = await fetch("/api/resolve-bot-move", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        game_id: (state && state.game_id) || (deferred && deferred.game_id),
+        moves: moves, human_color: humanColor, threads: threadsCount,
+        started_at: startedAt, mode: mode, base_seconds: baseSeconds,
+        increment: increment, clock: clockState, start_fen: startFen,
+      }),
+    });
+    if (res.ok) next = await res.json();
+  } catch (e) { /* fall through to retry */ }
+  if (!next) {
+    // Network hiccup while resolving: keep polling (TB is ready, so this should
+    // succeed shortly). Do not charge/alter anything client-side.
+    tbWarmPollTimer = setTimeout(() => pollWarmingStatus(deferred), 1000);
+    return;
+  }
+  const botUci = next.last_bot_move ? next.last_bot_move.uci : null;
+  if (!botUci || next.tb_warming) {
+    // Server still reports warming (race): keep polling.
+    tbWarmPollTimer = setTimeout(() => pollWarmingStatus(deferred), 1000);
+    return;
+  }
+  // Success: finalize the warming window, then reveal the bot move exactly like
+  // the normal reveal path (adopt state, render, sound/animation).
+  closeWarmingWindow();
+  if (CASettings.animations) {
+    revealBotAnimated(next, botUci);
+  } else {
+    adoptState(next);
+    renderAll();
+    playBotResolutionSound(next);
+    afterMoveResolved();
+    setBusy(false);
+  }
+}
+
+// Entry point invoked from the move flow when a response defers a bot move.
+function beginTablebaseWarming(deferred) {
+  if (tbWarming) return;   // already showing for this global warming state
+  tbWarming = true;
+  openWarmingWindow();
+  pollWarmingStatus(deferred);
 }
 
 // =========================================================================
@@ -1384,7 +1598,7 @@ if (cancelNewGameBtn) cancelNewGameBtn.addEventListener("click", closeNewGamePop
 if (resumeBtn) resumeBtn.addEventListener("click", resumeInProgress);
 if (resignBtn) resignBtn.addEventListener("click", resign);
 if (selfAnalysisToggle) selfAnalysisToggle.addEventListener("change", () => setSelfAnalysis(selfAnalysisToggle.checked));
-if (netErrorClose) netErrorClose.addEventListener("click", hideNetworkError);
+if (netErrorFallbackClose) netErrorFallbackClose.addEventListener("click", hideNetworkError);
 if (logoutBtn) logoutBtn.addEventListener("click", async () => {
   try {
     await fetch("/api/logout", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });

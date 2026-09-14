@@ -168,14 +168,17 @@ a:hover { color: var(--white); }
 .popout { border-color: var(--cyan); }
 .popout-actions { display: flex; gap: .5rem; margin-top: .4rem; }
 
-/* ---- network-error popout (cancellable overlay) ---- */
-.net-overlay[hidden] { display: none !important; }
-.net-overlay {
+/* ---- popup-blocker fallback notice ----
+   The primary network-error / tablebase-warming popups are REAL windows
+   (window.open in app.js). This in-page notice is shown only when a popup
+   blocker prevents opening the real window; it toggles via [hidden]. */
+.net-fallback[hidden] { display: none !important; }
+.net-fallback {
   position: fixed; inset: 0; background: var(--black);
   display: flex; align-items: center; justify-content: center; z-index: 60;
 }
-.net-box { border: 2px solid var(--red); background: var(--black); padding: 1rem; text-align: center; color: var(--red); max-width: 20rem; }
-.net-box p { margin: 0 0 .6rem; }
+.net-fallback-box { border: 2px solid var(--red); background: var(--black); padding: 1rem; text-align: center; color: var(--red); max-width: 20rem; }
+.net-fallback-box p { margin: 0 0 .6rem; }
 
 /* ---- delete-account confirmation overlay (explicit intent) ---- */
 .confirm-overlay[hidden] { display: none !important; }

@@ -216,18 +216,35 @@ def engine_move(board, threads=None):
     """Ask Chess Amateur for a move, validate it, push it. Returns (uci, san)
     or (None, None). The engine logs its full UCI output to the server logs;
     only the move is returned here (never the eval/PV)."""
-    uci = ENGINE.best_move(board.fen(), threads=threads)
+    uci, _san, _probe = engine_move_ex(board, threads=threads)
+    return uci, _san
+
+
+def engine_move_ex(board, threads=None):
+    """Like engine_move(), but also report whether the search emitted the
+    CA_TB_ABOUT_TO_PROBE marker.
+
+    Returns (uci, san, tb_probe_seen). tb_probe_seen is True iff the patched
+    engine signalled it was about to probe a searched position whose tablebase
+    is absent/insufficient. The marker itself is NEVER returned to the browser;
+    it only informs the app-layer deferral policy (FEAT-004). The move is
+    validated + pushed exactly as in engine_move(). On no legal move / invalid
+    move the pushed state is unchanged and (None, None, tb_probe_seen) is
+    returned (the probe flag is still reported so the caller can decide).
+    """
+    uci, tb_probe_seen = ENGINE.best_move_with_probe_flag(
+        board.fen(), threads=threads)
     if not uci:
-        return None, None
+        return None, None, tb_probe_seen
     try:
         move = chess.Move.from_uci(uci)
     except ValueError:
-        return None, None
+        return None, None, tb_probe_seen
     if move not in board.legal_moves:
-        return None, None
+        return None, None, tb_probe_seen
     san = board.san(move)
     board.push(move)
-    return uci, san
+    return uci, san, tb_probe_seen
 
 
 def _apply_book_uci(board, uci):
@@ -265,6 +282,63 @@ def reply_move(board, mode=None, threads=None, rng=None):
                 return got_uci, san
         # Not in book (or unusable) -> fall through to the engine.
     return engine_move(board, threads=threads)
+
+
+def reply_move_ex(board, mode=None, threads=None, rng=None, push=True):
+    """Choose Chess Amateur's reply and report deferral-relevant metadata.
+
+    Returns a dict:
+      {"uci": str|None, "san": str|None,
+       "from_book": bool,   # True iff the move came from the Polyglot book
+       "tb_probe_seen": bool}  # True iff the engine search hit CA_TB_ABOUT_TO_PROBE
+
+    Book moves (FIDE only) NEVER trigger deferral: from_book=True implies
+    tb_probe_seen=False (the book path does not spawn/consult the engine).
+
+    When `push` is True (default) the chosen move is validated + pushed onto
+    `board` exactly like reply_move(). When `push` is False the board is left
+    UNCHANGED (the move is still returned/validated as legal) -- this lets the
+    app-layer decide to DEFER an engine move (marker fired AND tablebases not
+    ready) without ever committing a tablebase-absent search result.
+
+    Single-process invariant preserved: the book probe never spawns an engine;
+    the engine path uses the single shared ENGINE.
+    """
+    if mode == "fide":
+        book_uci = book.book_move(board, rng=rng)
+        if book_uci:
+            # Validate the book move without necessarily pushing.
+            try:
+                move = chess.Move.from_uci(book_uci)
+            except ValueError:
+                move = None
+            if move is not None and move in board.legal_moves:
+                san = board.san(move)
+                if push:
+                    board.push(move)
+                return {"uci": book_uci, "san": san,
+                        "from_book": True, "tb_probe_seen": False}
+        # Not in book (or unusable) -> fall through to the engine.
+
+    # Engine path: run the search WITHOUT pushing so the caller can defer.
+    uci, tb_probe_seen = ENGINE.best_move_with_probe_flag(
+        board.fen(), threads=threads)
+    if not uci:
+        return {"uci": None, "san": None,
+                "from_book": False, "tb_probe_seen": tb_probe_seen}
+    try:
+        move = chess.Move.from_uci(uci)
+    except ValueError:
+        return {"uci": None, "san": None,
+                "from_book": False, "tb_probe_seen": tb_probe_seen}
+    if move not in board.legal_moves:
+        return {"uci": None, "san": None,
+                "from_book": False, "tb_probe_seen": tb_probe_seen}
+    san = board.san(move)
+    if push:
+        board.push(move)
+    return {"uci": uci, "san": san,
+            "from_book": False, "tb_probe_seen": tb_probe_seen}
 
 
 def state_dict(board, human_color, threads, san_history, moves_uci,

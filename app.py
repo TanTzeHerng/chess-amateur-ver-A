@@ -42,6 +42,7 @@ import clockclient
 import eco
 import fide
 import puzzles as P
+import syzygy
 from storage import Store
 
 # Default seed rating for any FIDE time control the player does not hold (or
@@ -74,6 +75,13 @@ app.config.update(
 )
 
 STORE = Store()  # reads DATABASE_URL; disabled (guest-only) if unset/unreachable
+
+# Kick off the ~386 MB Syzygy tablebase download in a BACKGROUND daemon thread
+# at import/boot. This is deliberately NON-blocking: gunicorn binds the port
+# immediately (so Render never reports 'No open ports detected') while the
+# download proceeds in the background under the single worker. The frontend
+# polls GET /api/tablebase-status for progress. A no-op when SYZYGY_DISABLE=1.
+syzygy.start_background_download()
 
 
 def _now_iso():
@@ -1155,6 +1163,7 @@ def api_move():
     # --- Engine reply if the game continues ---------------------------------
     last_bot_move = None
     bot_think = 0.0
+    tb_warming = False
     if not board.is_game_over(claim_draw=True):
         # FIDE mode: the human-like TIME MANAGER decides how long Chess Amateur
         # "thinks" (via the external model + scaling); that time is deducted
@@ -1193,11 +1202,46 @@ def api_move():
         try:
             # FIDE-rated mode uses the Polyglot book (pc2500.bin) when the
             # position is in it, else falls through to Stockfish depth 1.
-            # Rated/Casual never consult the book.
-            uci, san = core.reply_move(board, mode=mode, threads=threads)
+            # Rated/Casual never consult the book. push=False so we can DEFER
+            # an engine move (tablebase warming) WITHOUT committing a
+            # tablebase-absent search result to the game.
+            reply = core.reply_move_ex(board, mode=mode, threads=threads,
+                                       push=False)
         except core.EngineUnavailable:
             return jsonify({"error": "engine unavailable"}), 500
-        if uci:
+        uci, san = reply["uci"], reply["san"]
+
+        # TABLEBASE-WARMING DEFERRAL (FEAT-004): if this search was about to
+        # probe a tablebase that is not yet fully downloaded, we must NOT use
+        # the tablebase-absent result. Book moves never defer (from_book).
+        # The bot is still charged EXACTLY the ChessMimic think-time it WOULD
+        # be charged if the tablebase were present -- the download WAIT is NOT
+        # charged. The move itself is left PENDING (bot move not pushed) until
+        # the tablebases are ready, at which point the client re-requests it
+        # via /api/resolve-bot-move and a FRESH search resolves it.
+        # Deferral (with ChessMimic clock preservation) is scoped to
+        # FIDE-with-clock: those are the games that have a time model to
+        # preserve. Rated/Casual/unlimited move instantly (no clock model) and
+        # are unaffected. Book moves never defer.
+        defer = (mode == "fide" and not unlimited
+                 and uci is not None
+                 and not reply["from_book"]
+                 and reply["tb_probe_seen"]
+                 and not syzygy.status().get("ready", True))
+
+        if defer:
+            tb_warming = True
+            # Charge the bot clock EXACTLY as if the move had been made
+            # (ChessMimic think-time only; the warming wait is NOT charged).
+            if not unlimited:
+                bot_prev = float(clock.get(bot_color, base_seconds))
+                clock[bot_color] = bot_prev - bot_think + increment
+            # last_bot_move stays None; the bot move is NOT pushed. The human
+            # move IS applied and persisted; the bot move is pending.
+        elif uci:
+            # Commit the chosen reply (engine or book) to the game.
+            move = core.chess.Move.from_uci(uci)
+            board.push(move)
             san_history.append(san)
             moves_uci.append(uci)
             last_bot_move = {"uci": uci, "san": san}
@@ -1238,6 +1282,12 @@ def api_move():
     # move for that real duration before revealing it (FIDE-mode human pacing).
     # Only meaningful in FIDE mode with a clock; 0 otherwise (instant).
     extra["bot_think"] = bot_think if (mode == "fide" and not unlimited) else 0.0
+    # TABLEBASE-WARMING (FEAT-004): when true, the bot move is PENDING because
+    # its search was about to probe a not-yet-downloaded tablebase. last_bot_move
+    # is None and the client should show the "warming up" window + poll
+    # /api/tablebase-status, then call /api/resolve-bot-move once ready. The bot
+    # was already charged bot_think (the download wait is NOT charged).
+    extra["tb_warming"] = tb_warming
     return jsonify(core.state_dict(board, human_color, threads, san_history,
                                    moves_uci, game_id=gid,
                                    last_bot_move=last_bot_move, extra=extra,
@@ -1277,6 +1327,143 @@ def _move_extra(user, mode, base_seconds, increment, started_at, clock,
         # winner-phrased tail here (e.g. '1-0 (White won on time)').
         extra["result_line"] = core.result_line(result, result_reason)
     return extra
+
+
+@app.post("/api/resolve-bot-move")
+def api_resolve_bot_move():
+    """Resolve a bot move that was DEFERRED because tablebases were warming up.
+
+    STATELESS + client-carried: the request carries the SAME move list that was
+    returned by the deferring /api/move response (the human move applied, the
+    bot move pending) plus the game context (human_color, mode, threads,
+    start_fen). No think-time is (re)computed here: the bot was ALREADY charged
+    exactly the single ChessMimic think-time during the deferring /api/move, and
+    the client carries the already-decremented clock. This endpoint therefore
+    does NOT touch the clock; it only runs a FRESH search once tablebases are
+    ready and returns the bot move.
+
+    Behavior:
+      * If tablebases are NOT ready yet -> respond tb_warming:true, last_bot_move
+        None (the client keeps polling /api/tablebase-status and retries).
+      * If ready -> run a FRESH search of the current position (Stockfish is only
+        called for a fresh search once tablebases are all downloaded), push the
+        bot move, persist in-progress state, and return the updated game state.
+    """
+    data = request.get_json(silent=True) or {}
+    human_color = str(data.get("human_color", "white")).lower()
+    if human_color not in ("white", "black"):
+        human_color = "white"
+    bot_color = "black" if human_color == "white" else "white"
+    threads = core.coerce_threads(data.get("threads"))
+    mode = _parse_mode(data.get("mode"))
+    user = _current_user()
+    if mode in ("fide", "rated") and not user:
+        mode = "casual"
+
+    base_seconds = data.get("base_seconds")
+    increment = data.get("increment") or 0
+    if isinstance(base_seconds, bool):
+        base_seconds = None
+    unlimited = base_seconds is None
+
+    start_fen = data.get("fen") or data.get("start_fen")
+    if start_fen is not None and not str(start_fen).strip():
+        start_fen = None
+
+    gid = data.get("game_id")
+    started_at = data.get("started_at") or _now_iso()
+    if user:
+        ip = STORE.get_in_progress_game(user["id"])
+        if ip is not None:
+            gid = ip["id"]
+            started_at = ip["started_at"]
+            base_seconds = ip["base_seconds"]
+            increment = ip["increment"]
+            unlimited = base_seconds is None
+            if ip.get("mode"):
+                mode = _parse_mode(ip["mode"])
+            if ip.get("start_fen"):
+                start_fen = ip["start_fen"]
+
+    if mode != "casual":
+        start_fen = None
+
+    # The clock is carried by the client, already reflecting the bot_think
+    # charged by the deferring /api/move. We do NOT modify it here.
+    clock = data.get("clock")
+    if not unlimited and not isinstance(clock, dict):
+        clock = {"white": float(base_seconds), "black": float(base_seconds)}
+
+    try:
+        board, san_history, moves_uci = core.rebuild_board(
+            data.get("moves"), start_fen=start_fen)
+    except core.InvalidStartFen:
+        return jsonify({"error": "invalid FEN"}), 400
+    except core.InvalidMoveHistory:
+        return jsonify({"error": "invalid move history"}), 400
+
+    if board.is_game_over(claim_draw=True):
+        return jsonify({"error": "game is over"}), 400
+
+    # Not ready yet: keep the move pending; the client should keep polling.
+    if not syzygy.status().get("ready", True):
+        extra = _move_extra(user, mode, base_seconds, increment, started_at,
+                            clock, in_progress=bool(user), game_over=False)
+        extra["bot_think"] = 0.0
+        extra["tb_warming"] = True
+        return jsonify(core.state_dict(
+            board, human_color, threads, san_history, moves_uci, game_id=gid,
+            last_bot_move=None, extra=extra, start_fen=start_fen))
+
+    # Tablebases are ready: run a FRESH search of the current position and use
+    # its result. No extra think-time is charged (the single ChessMimic
+    # bot_think was already applied by the deferring /api/move).
+    last_bot_move = None
+    try:
+        uci, san = core.reply_move(board, mode=mode, threads=threads)
+    except core.EngineUnavailable:
+        return jsonify({"error": "engine unavailable"}), 500
+    if uci:
+        san_history.append(san)
+        moves_uci.append(uci)
+        last_bot_move = {"uci": uci, "san": san}
+
+    game_over = board.is_game_over(claim_draw=True)
+
+    rating_delta = None
+    if user:
+        if game_over:
+            result = board.result(claim_draw=True)
+            rating_delta = _apply_result_and_rating(
+                user, mode, human_color, base_seconds, increment, result)
+            eco_code, eco_name = _eco_for(moves_uci)
+            STORE.finish_game(
+                user_id=user["id"], game_id=gid, human_color=human_color,
+                result=result, result_reason=core.result_reason(board),
+                moves_uci=moves_uci, started_at=started_at,
+                ended_at=_now_iso(), base_seconds=base_seconds,
+                increment=increment, rating_delta=rating_delta,
+                eco_code=eco_code, eco_name=eco_name, mode=mode,
+                player_rating_after=_player_rating_after(
+                    user, mode, base_seconds, increment))
+        else:
+            gid = _persist_in_progress(user["id"], gid, human_color,
+                                       moves_uci, started_at,
+                                       base_seconds=base_seconds,
+                                       increment=increment, clock=clock,
+                                       mode=mode, start_fen=start_fen)
+
+    extra = _move_extra(user, mode, base_seconds, increment, started_at, clock,
+                        in_progress=bool(user) and not game_over,
+                        game_over=game_over, rating_delta=rating_delta)
+    # The bot was already charged its single ChessMimic think-time on the
+    # deferring /api/move; nothing more is charged for the fresh search.
+    extra["bot_think"] = 0.0
+    extra["tb_warming"] = False
+    return jsonify(core.state_dict(board, human_color, threads, san_history,
+                                   moves_uci, game_id=gid,
+                                   last_bot_move=last_bot_move, extra=extra,
+                                   start_fen=start_fen))
 
 
 @app.post("/api/resign")
@@ -1401,6 +1588,17 @@ def api_game(game_id):
 def healthz():
     return jsonify({"status": "ok", "bot": core.BOT_NAME,
                     "accounts_enabled": STORE.enabled})
+
+
+@app.get("/api/tablebase-status")
+def tablebase_status():
+    """GLOBAL (server-wide) Syzygy download progress for the warming-up UI.
+
+    Returns {ready, downloaded, total, percent}. Single worker, so this is one
+    server-wide state (NOT per-user); no auth required. Deliberately decoupled
+    from /healthz -- healthz stays instant and never waits on the download.
+    """
+    return jsonify(syzygy.status())
 
 
 def main():

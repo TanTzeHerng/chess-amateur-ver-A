@@ -1,0 +1,50 @@
+Chess Amateur probe instrumentation patch for Stockfish sf_17.
+
+This patch adds a single, minimal UCI emission inside the "Step 5. Tablebases
+probe" block of src/search.cpp. When Stockfish is about to probe the Syzygy
+tablebases for a position it is SEARCHING (i.e. the piece count / depth /
+rule50 / castling guards already decided a probe is warranted) but the probe
+FAILS because the tablebase is not loaded or insufficient
+(err == TB::ProbeState::FAIL), the engine prints the distinctive UCI line:
+
+    info string CA_TB_ABOUT_TO_PROBE
+
+The Chess Amateur app reads the raw UCI stream (engine.py::_uci_log) and uses
+this marker to detect that a tablebase probe WOULD have occurred for a searched
+endgame position while the tablebases are still downloading, so it can defer the
+move until the download completes.
+
+Design notes:
+  * The marker fires ONLY on err == TB::ProbeState::FAIL, so when the tablebase
+    IS present (probe succeeds) nothing is emitted -> no UCI spam in normal play.
+  * The existing `if (err != TB::ProbeState::FAIL)` branch (which uses the WDL
+    result and can prune/return) is left completely untouched, so search results
+    are identical to stock Stockfish. This block is pure instrumentation.
+  * The guard conditions of the enclosing `if` already ensure this is a
+    position Stockfish is SEARCHING (not merely the current/root board), and
+    that its piece count is within the probe cardinality -- exactly the
+    "about to probe" moment required.
+  * sync_cout / sync_endl are Stockfish's thread-safe UCI output convention and
+    are already used elsewhere in this same file (search.cpp).
+
+diff --git a/src/search.cpp b/src/search.cpp
+--- a/src/search.cpp
++++ b/src/search.cpp
+@@ -643,6 +643,17 @@
+         {
+             TB::ProbeState err;
+             TB::WDLScore   wdl = Tablebases::probe_wdl(pos, &err);
++
++            // Chess Amateur probe instrumentation.
++            // A probe was attempted for this SEARCHED position (the piece
++            // count / depth / rule50 / castling guards above already decided a
++            // probe is warranted) but it FAILED because the tablebase is not
++            // loaded or insufficient. Emit a distinctive UCI marker so the app
++            // can detect "about to probe but tablebase absent" while the Syzygy
++            // download is still in progress. Fires only on FAIL, so it never
++            // spams when the tablebase is present, and it does not alter search.
++            if (err == TB::ProbeState::FAIL)
++                sync_cout << "info string CA_TB_ABOUT_TO_PROBE" << sync_endl;
+ 
+             // Force check of time on the next occasion
+             if (is_mainthread())
