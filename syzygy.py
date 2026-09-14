@@ -24,7 +24,7 @@ Environment:
                   If explicitly set to empty, tablebases are DISABLED.
   SYZYGY_URL      Base URL to download individual .rtbw files from. Default is
                   the public Lichess Syzygy mirror
-                  (https://tablebase.lichess.ovh/tables/standard/3-4-5/).
+                  (https://tablebase.lichess.ovh/tables/standard/3-4-5-wdl/).
   SYZYGY_DISABLE  Set to "1"/"true" to skip the download AND unset SyzygyPath
                   (used by tests / local dev so no network is touched).
 
@@ -40,7 +40,7 @@ import sys
 import urllib.request
 
 DEFAULT_SYZYGY_DIR = "/tmp/syzygy"
-DEFAULT_SYZYGY_URL = "https://tablebase.lichess.ovh/tables/standard/3-4-5/"
+DEFAULT_SYZYGY_URL = "https://tablebase.lichess.ovh/tables/standard/3-4-5-wdl/"
 # Marker file (inside the target dir) written after a COMPLETE download so a
 # restart can trust the directory and skip re-downloading.
 MARKER_NAME = ".syzygy_complete"

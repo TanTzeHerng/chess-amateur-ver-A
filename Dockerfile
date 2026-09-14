@@ -83,7 +83,7 @@ COPY templates/ ./templates/
 #                   EPHEMERAL path -- NOT baked into the image, NOT a paid
 #                   persistent disk). Set to "" to DISABLE tablebases.
 #   SYZYGY_URL    : Base URL to download the individual .rtbw files from.
-#                   Default https://tablebase.lichess.ovh/tables/standard/3-4-5/
+#                   Default https://tablebase.lichess.ovh/tables/standard/3-4-5-wdl/
 #                   (the public Lichess Syzygy mirror). WDL-only (~386 MB): at
 #                   depth 1 the WDL tables are what change the root move; the
 #                   DTZ tables are not needed.
