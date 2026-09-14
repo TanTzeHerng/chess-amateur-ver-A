@@ -42,6 +42,22 @@ const newGamePopout = document.getElementById("newGamePopout");
 const startGameBtn = document.getElementById("startGame");
 const cancelNewGameBtn = document.getElementById("cancelNewGame");
 const tcInputs = document.getElementById("tcInputs");
+// custom-position (casual only) + board editor
+const customChoice = document.getElementById("customChoice");
+const customEnable = document.getElementById("customEnable");
+const customBody = document.getElementById("customBody");
+const customFen = document.getElementById("customFen");
+const customFenError = document.getElementById("customFenError");
+const openEditorBtn = document.getElementById("openEditor");
+const editorOverlay = document.getElementById("editorOverlay");
+const editorBoardEl = document.getElementById("editorBoard");
+const editorPaletteEl = document.getElementById("editorPalette");
+const editorError = document.getElementById("editorError");
+const editorEp = document.getElementById("editorEp");
+const editorHalfmove = document.getElementById("editorHalfmove");
+const editorUseBtn = document.getElementById("editorUse");
+const editorClearBtn = document.getElementById("editorClear");
+const editorCancelBtn = document.getElementById("editorCancel");
 // self-analysis
 const selfAnalysisRow = document.getElementById("selfAnalysisRow");
 const selfAnalysisToggle = document.getElementById("selfAnalysisToggle");
@@ -53,6 +69,21 @@ const advancedBody = document.getElementById("advancedBody");
 const profileToggle = document.getElementById("profileToggle");
 const profileBody = document.getElementById("profileBody");
 const logoutBtn = document.getElementById("logoutBtn");
+const deleteAccountBtn = document.getElementById("deleteAccountBtn");
+const deleteAccountOverlay = document.getElementById("deleteAccountOverlay");
+const deleteAccountConfirm = document.getElementById("deleteAccountConfirm");
+const deleteAccountCancel = document.getElementById("deleteAccountCancel");
+// dashboard (FEAT-010): rating line graphs over a customizable period
+const dashboardBtn = document.getElementById("dashboardBtn");
+const dashboardOverlay = document.getElementById("dashboardOverlay");
+const dashboardClose = document.getElementById("dashboardClose");
+const dashboardPeriod = document.getElementById("dashboardPeriod");
+const dashboardCustomRange = document.getElementById("dashboardCustomRange");
+const dashboardFrom = document.getElementById("dashboardFrom");
+const dashboardTo = document.getElementById("dashboardTo");
+const dashboardApply = document.getElementById("dashboardApply");
+const dashboardCharts = document.getElementById("dashboardCharts");
+const dashboardEmpty = document.getElementById("dashboardEmpty");
 // settings toggles
 const animToggle = document.getElementById("animToggle");
 const soundToggle = document.getElementById("soundToggle");
@@ -78,6 +109,7 @@ const reviewEndEl = document.getElementById("reviewEnd");
 // --- client state ---
 let state = null;
 let moves = [];
+let startFen = null;   // custom starting position (null => standard start)
 let humanColor = "white";
 let threadsCount = CFG.defaultThreads || 128;
 let startedAt = null;
@@ -360,6 +392,7 @@ async function submitTimeout() {
         human_color: humanColor, threads: threadsCount, mode: mode,
         base_seconds: baseSeconds, increment: increment,
         clock: clockState, elapsed: 1e9, started_at: startedAt,
+        start_fen: startFen,
       }),
     });
     if (res.ok) { adoptState(await res.json()); renderAll(); afterMoveResolved(); }
@@ -490,6 +523,7 @@ function setBusy(on) {
 function adoptState(s) {
   state = s;
   if (Array.isArray(s.moves)) moves = s.moves;
+  if ("start_fen" in s) startFen = s.start_fen || null;
   if (typeof s.threads === "number") threadsCount = s.threads;
   if (typeof s.human_color === "string") humanColor = s.human_color;
   if (typeof s.started_at === "string") startedAt = s.started_at;
@@ -530,7 +564,7 @@ async function sendMove(uci, fromSq, toSq) {
           game_id: state.game_id, move: uci, moves: moves,
           human_color: humanColor, threads: threadsCount, started_at: startedAt,
           mode: mode, base_seconds: baseSeconds, increment: increment,
-          clock: clockSnapshot, elapsed: elapsed,
+          clock: clockSnapshot, elapsed: elapsed, start_fen: startFen,
         }),
       });
       // Illegal move: silently disallow, just re-render (no message/hint).
@@ -639,7 +673,8 @@ function revealBotAnimated(next, botUci) {
   };
   fetch("/api/view", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ moves: interMoves, human_color: humanColor }),
+    body: JSON.stringify({ moves: interMoves, human_color: humanColor,
+                           start_fen: startFen }),
   }).then(r => r.ok ? r.json() : null)
     .then(d => finish(d ? d.fen : null))
     .catch(() => finish(null));
@@ -713,6 +748,7 @@ function openNewGamePopout() {
   hideSpeechBubble();
   if (newGamePopout) newGamePopout.hidden = false;
   syncTcInputs();
+  syncCustomVisibility();
 }
 function closeNewGamePopout() {
   if (newGamePopout) newGamePopout.hidden = true;
@@ -721,6 +757,197 @@ function syncTcInputs() {
   const tcEl = document.querySelector('input[name="tc"]:checked');
   const unlimited = tcEl && tcEl.value === "unlimited";
   if (tcInputs) tcInputs.hidden = !!unlimited;
+}
+
+// =========================================================================
+// Custom position (Casual mode only) + board editor
+// =========================================================================
+// The editor's working board: a { square: pieceChar } map, editable by the
+// user. Placing/erasing pieces, side to move, per-side K/Q castling rights, the
+// en-passant target square and the halfmove clock all feed buildEditorFen().
+let editorPieces = {};
+let editorSelected = "P";   // currently-selected palette piece ("" => erase)
+
+// Show the custom-position fieldset ONLY in casual mode (per the spec). When
+// leaving casual, force the custom option off so a rated/FIDE game never
+// carries a custom FEN.
+function syncCustomVisibility() {
+  const casual = chosenMode() === "casual";
+  if (customChoice) customChoice.hidden = !casual;
+  if (!casual && customEnable) {
+    customEnable.checked = false;
+    if (customBody) customBody.hidden = true;
+  }
+}
+
+// The custom FEN to start from, or null when the option is off / empty. Casual
+// only; returns null otherwise so rated/FIDE never send a FEN.
+function chosenCustomFen() {
+  if (chosenMode() !== "casual") return null;
+  if (!customEnable || !customEnable.checked) return null;
+  const raw = (customFen && customFen.value ? customFen.value : "").trim();
+  return raw || null;
+}
+
+// The standard 8x8 order for building/reading a FEN piece-placement field.
+function buildEditorFen() {
+  const turnEl = document.querySelector('input[name="editorTurn"]:checked');
+  const turn = turnEl ? turnEl.value : "w";
+  let placement = "";
+  for (let rank = 8; rank >= 1; rank--) {
+    let empty = 0;
+    for (let file = 0; file < 8; file++) {
+      const sq = String.fromCharCode(97 + file) + rank;
+      const pc = editorPieces[sq];
+      if (pc) {
+        if (empty) { placement += empty; empty = 0; }
+        placement += pc;
+      } else { empty += 1; }
+    }
+    if (empty) placement += empty;
+    if (rank > 1) placement += "/";
+  }
+  let castling = "";
+  if (document.getElementById("castWK").checked) castling += "K";
+  if (document.getElementById("castWQ").checked) castling += "Q";
+  if (document.getElementById("castBK").checked) castling += "k";
+  if (document.getElementById("castBQ").checked) castling += "q";
+  if (!castling) castling = "-";
+  let ep = (editorEp && editorEp.value ? editorEp.value : "-").trim() || "-";
+  let half = parseInt((editorHalfmove || {}).value, 10);
+  if (!isFinite(half) || half < 0) half = 0;
+  // Fullmove number is not user-facing here; a valid FEN needs one (>=1).
+  return placement + " " + turn + " " + castling + " " + ep + " " + half + " 1";
+}
+
+function renderEditorBoard() {
+  if (!editorBoardEl) return;
+  editorBoardEl.innerHTML = "";
+  // Always White's perspective in the editor (rank 8 at top).
+  for (let rank = 8; rank >= 1; rank--) {
+    for (let file = 0; file < 8; file++) {
+      const sq = String.fromCharCode(97 + file) + rank;
+      const cell = document.createElement("div");
+      cell.className = "editor-sq " + (isLightSquare(file, rank) ? "light" : "dark");
+      cell.setAttribute("data-square", sq);
+      const pc = editorPieces[sq];
+      if (pc) {
+        const span = document.createElement("span");
+        span.className = "piece " + (pc === pc.toUpperCase() ? "white" : "black");
+        span.textContent = GLYPHS[pc];
+        cell.appendChild(span);
+      }
+      cell.addEventListener("click", () => {
+        if (editorSelected === "") delete editorPieces[sq];
+        else editorPieces[sq] = editorSelected;
+        renderEditorBoard();
+      });
+      editorBoardEl.appendChild(cell);
+    }
+  }
+}
+
+function renderEditorPalette() {
+  if (!editorPaletteEl) return;
+  editorPaletteEl.innerHTML = "";
+  const order = ["K", "Q", "R", "B", "N", "P",
+                 "k", "q", "r", "b", "n", "p", ""];
+  order.forEach((pc) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "editor-palette-btn";
+    if (pc === editorSelected) btn.className += " selected";
+    if (pc === "") { btn.textContent = "Erase"; }
+    else {
+      const span = document.createElement("span");
+      span.className = "piece " + (pc === pc.toUpperCase() ? "white" : "black");
+      span.textContent = GLYPHS[pc];
+      btn.appendChild(span);
+    }
+    btn.addEventListener("click", () => {
+      editorSelected = pc;
+      renderEditorPalette();
+    });
+    editorPaletteEl.appendChild(btn);
+  });
+}
+
+// Seed the editor from the FEN currently typed in (if any), else the standard
+// start position, so the user edits from a sensible base.
+function seedEditorFromFen(fen) {
+  editorPieces = {};
+  const base = (fen && fen.trim()) ||
+    "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  const parts = base.trim().split(/\s+/);
+  const rows = parts[0].split("/");
+  if (rows.length === 8) {
+    for (let r = 0; r < 8; r++) {
+      const rank = 8 - r; let file = 0;
+      for (const ch of rows[r]) {
+        if (/\d/.test(ch)) file += parseInt(ch, 10);
+        else if (file < 8) { editorPieces[String.fromCharCode(97 + file) + rank] = ch; file += 1; }
+      }
+    }
+  }
+  // Side to move.
+  const turn = parts[1] === "b" ? "b" : "w";
+  const turnEl = document.querySelector('input[name="editorTurn"][value="' + turn + '"]');
+  if (turnEl) turnEl.checked = true;
+  // Castling rights.
+  const cr = parts[2] || "-";
+  document.getElementById("castWK").checked = cr.indexOf("K") !== -1;
+  document.getElementById("castWQ").checked = cr.indexOf("Q") !== -1;
+  document.getElementById("castBK").checked = cr.indexOf("k") !== -1;
+  document.getElementById("castBQ").checked = cr.indexOf("q") !== -1;
+  if (editorEp) editorEp.value = parts[3] || "-";
+  if (editorHalfmove) editorHalfmove.value = parts[4] || "0";
+}
+
+function openEditor() {
+  seedEditorFromFen(customFen ? customFen.value : "");
+  editorSelected = "P";
+  if (editorError) { editorError.hidden = true; editorError.textContent = ""; }
+  renderEditorPalette();
+  renderEditorBoard();
+  if (editorOverlay) editorOverlay.hidden = false;
+}
+function closeEditor() { if (editorOverlay) editorOverlay.hidden = true; }
+
+// Validate the editor's FEN by asking the server (python-chess is the source
+// of truth). On success, write it into the FEN input and close the editor.
+async function useEditorPosition() {
+  const fen = buildEditorFen();
+  try {
+    const res = await fetch("/api/view", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ human_color: "white", start_fen: fen, moves: [] }),
+    });
+    if (res.status === 400) {
+      if (editorError) {
+        editorError.textContent = "That position is not a legal FEN. " +
+          "Check kings, side to move and castling rights.";
+        editorError.hidden = false;
+      }
+      return;
+    }
+    if (!res.ok) {
+      if (editorError) {
+        editorError.textContent = "Could not validate the position (" + res.status + ").";
+        editorError.hidden = false;
+      }
+      return;
+    }
+  } catch (e) {
+    if (editorError) {
+      editorError.textContent = "A network error occurred validating the position.";
+      editorError.hidden = false;
+    }
+    return;
+  }
+  if (customFen) customFen.value = fen;
+  if (customEnable) customEnable.checked = true;
+  if (customBody) customBody.hidden = false;
+  closeEditor();
 }
 
 // Impatience speech bubble under Chess Amateur.
@@ -749,11 +976,17 @@ async function startNewGame() {
   mode = chosenMode();
   const tc = chosenTimeControl();
   moves = []; startedAt = null; clockState = null; humanClockRunning = false;
+  startFen = null;
   playerRating = null; botRating = null;
   setBusy(true); selected = null;
   try {
     const body = Object.assign(
       { human_color: humanColor, threads: threadsCount, mode: mode }, tc);
+    // Casual-only custom start position (pasted FEN or board-editor FEN). The
+    // server re-validates and returns start_fen, which we then carry back on
+    // every /api/move for the stateless replay.
+    const customFenValue = chosenCustomFen();
+    if (customFenValue) body.fen = customFenValue;
     const res = await fetch("/api/new", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -846,15 +1079,18 @@ async function resumeInProgress() {
 }
 
 async function renderFromMoves(moveList, color, started, live, resumeInfo) {
+  const resumeStartFen = (resumeInfo && resumeInfo.start_fen) || null;
   const res = await fetch("/api/view", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ moves: moveList, human_color: color }),
+    body: JSON.stringify({ moves: moveList, human_color: color,
+                           start_fen: resumeStartFen }),
   });
   if (!res.ok) return;
   const s = await res.json();
   adoptState(s);
   humanColor = color;
   moves = moveList;
+  startFen = resumeStartFen;
   startedAt = started || s.started_at;
   inProgress = !!live;
   replayMode = false;
@@ -1155,9 +1391,288 @@ if (logoutBtn) logoutBtn.addEventListener("click", async () => {
   } catch (e) { /* ignore */ }
   window.location.href = "/";
 });
+
+// Delete account: require an explicit confirmation through the palette overlay
+// (NOT a raw window.confirm) before POSTing. On success the server has cleared
+// the session; redirect home.
+function openDeleteAccountConfirm() {
+  if (deleteAccountOverlay) deleteAccountOverlay.hidden = false;
+}
+function closeDeleteAccountConfirm() {
+  if (deleteAccountOverlay) deleteAccountOverlay.hidden = true;
+}
+if (deleteAccountBtn) deleteAccountBtn.addEventListener("click", openDeleteAccountConfirm);
+if (deleteAccountCancel) deleteAccountCancel.addEventListener("click", closeDeleteAccountConfirm);
+if (deleteAccountConfirm) deleteAccountConfirm.addEventListener("click", async () => {
+  try {
+    const res = await fetch("/api/delete-account", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+    if (!res.ok) {
+      closeDeleteAccountConfirm();
+      showNetworkError("Could not delete your account. Please try again.");
+      return;
+    }
+  } catch (e) {
+    closeDeleteAccountConfirm();
+    showNetworkError("Could not delete your account. Please try again.");
+    return;
+  }
+  window.location.href = "/";
+});
+
+// ---------------------------------------------------------------------------
+// Dashboard (FEAT-010): line graphs of the player's gameplay (FIDE classes +
+// Rated) and puzzle ratings over a customizable from/to period. The graphs are
+// lightweight inline SVG (no external chart library) drawn in the strict
+// 8-color palette: one distinct pure color per series, axes/gridlines in blue.
+// ---------------------------------------------------------------------------
+const DASHBOARD_SERIES = [
+  { kind: "fide_blitz", label: "FIDE blitz", color: "#00ff00" },     // green
+  { kind: "fide_rapid", label: "FIDE rapid", color: "#00ffff" },     // cyan
+  { kind: "fide_classical", label: "FIDE classical", color: "#ffff00" }, // yellow
+  { kind: "rated", label: "Rated", color: "#ff00ff" },               // magenta
+  { kind: "puzzle", label: "Puzzle", color: "#ffffff" },             // white
+];
+const DASH_AXIS = "#0000ff"; // blue axes/gridlines (pure palette color)
+
+function svgEl(name, attrs) {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", name);
+  if (attrs) {
+    for (const k in attrs) {
+      if (attrs.hasOwnProperty(k)) el.setAttribute(k, attrs[k]);
+    }
+  }
+  return el;
+}
+
+// Render-only downsampling for the dashboard chart. When a per-day series has
+// more points than the chart is wide in pixels (> ~1 point/px), the polyline
+// vertices/segments overplot and the connecting line becomes visually covered.
+// This PURE helper reduces `points` to at most `maxPoints` evenly spaced
+// entries while ALWAYS preserving the first (index 0) and last (index n-1)
+// points so endpoints stay accurate. It never mutates the input array. When
+// points.length <= maxPoints the input is returned unchanged (same reference).
+function downsampleForRender(points, maxPoints) {
+  const n = points.length;
+  if (n <= maxPoints) return points;
+  const out = [];
+  let prev = -1;
+  for (let i = 0; i < maxPoints; i++) {
+    const idx = Math.round((i * (n - 1)) / (maxPoints - 1));
+    if (idx !== prev) {
+      out.push(points[idx]);
+      prev = idx;
+    }
+  }
+  return out;
+}
+// Expose the pure reducer on window so it is unit-testable (additive; does not
+// redeclare Settings/Sound).
+window.CA_downsampleForRender = downsampleForRender;
+
+// Draw ONE series as an inline SVG line graph. `points` is the per-day series
+// [{date, rating}, ...] already ordered ascending by GMT+8 calendar day (one
+// point per day, last-known-value). The x-axis is the per-day index. Returns
+// an SVG element.
+function renderDashboardChart(series, points) {
+  const W = 520, H = 180, PADL = 44, PADR = 12, PADT = 14, PADB = 26;
+  const svg = svgEl("svg", {
+    viewBox: "0 0 " + W + " " + H, class: "dash-chart",
+    width: W, height: H, role: "img",
+    "aria-label": series.label + " rating over time",
+  });
+  // Axes.
+  svg.appendChild(svgEl("line", {
+    x1: PADL, y1: PADT, x2: PADL, y2: H - PADB, stroke: DASH_AXIS,
+    "stroke-width": 1, class: "dash-axis",
+  }));
+  svg.appendChild(svgEl("line", {
+    x1: PADL, y1: H - PADB, x2: W - PADR, y2: H - PADB, stroke: DASH_AXIS,
+    "stroke-width": 1, class: "dash-axis",
+  }));
+  // Downsample FOR RENDER ONLY so the polyline stays visible on wide windows.
+  // The raw `points` array (and the /api/dashboard response) is not mutated.
+  const plotted = downsampleForRender(points, W);
+  const n = plotted.length;
+  // Compute rating extent (pad a little so a flat line is visible).
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const r = plotted[i].rating;
+    if (r < lo) lo = r;
+    if (r > hi) hi = r;
+  }
+  if (!isFinite(lo)) { lo = 0; hi = 1; }
+  if (lo === hi) { lo -= 10; hi += 10; }
+  const span = hi - lo;
+  function xAt(i) {
+    if (n <= 1) return PADL + (W - PADL - PADR) / 2;
+    return PADL + (i / (n - 1)) * (W - PADL - PADR);
+  }
+  function yAt(r) {
+    return PADT + (1 - (r - lo) / span) * (H - PADT - PADB);
+  }
+  // Y-axis min/max labels.
+  const yTop = svgEl("text", { x: PADL - 6, y: PADT + 4, class: "dash-label",
+    "text-anchor": "end", fill: DASH_AXIS });
+  yTop.textContent = String(Math.round(hi));
+  svg.appendChild(yTop);
+  const yBot = svgEl("text", { x: PADL - 6, y: H - PADB, class: "dash-label",
+    "text-anchor": "end", fill: DASH_AXIS });
+  yBot.textContent = String(Math.round(lo));
+  svg.appendChild(yBot);
+  // The polyline (or a single marker if there is just one point).
+  if (n === 1) {
+    svg.appendChild(svgEl("circle", {
+      cx: xAt(0), cy: yAt(plotted[0].rating), r: 3, fill: series.color,
+    }));
+  } else {
+    let d = "";
+    for (let i = 0; i < n; i++) {
+      d += (i === 0 ? "M" : "L") + xAt(i).toFixed(1) + "," + yAt(plotted[i].rating).toFixed(1) + " ";
+    }
+    svg.appendChild(svgEl("path", {
+      d: d.trim(), fill: "none", stroke: series.color, "stroke-width": 2,
+      class: "dash-line",
+    }));
+  }
+  return svg;
+}
+
+function renderDashboard(data) {
+  if (!dashboardCharts) return;
+  dashboardCharts.textContent = "";
+  const seriesData = (data && data.series) || {};
+  let any = false;
+  for (let s = 0; s < DASHBOARD_SERIES.length; s++) {
+    const series = DASHBOARD_SERIES[s];
+    const points = seriesData[series.kind] || [];
+    if (!points.length) continue;
+    any = true;
+    const card = document.createElement("div");
+    card.className = "dash-card";
+    const head = document.createElement("div");
+    head.className = "dash-card-head";
+    const swatch = document.createElement("span");
+    swatch.className = "dash-swatch";
+    swatch.style.backgroundColor = series.color;
+    const title = document.createElement("span");
+    title.className = "dash-card-title";
+    const latest = points[points.length - 1].rating;
+    title.textContent = series.label + " (" + Math.round(latest) + ")";
+    head.appendChild(swatch);
+    head.appendChild(title);
+    card.appendChild(head);
+    card.appendChild(renderDashboardChart(series, points));
+    dashboardCharts.appendChild(card);
+  }
+  if (dashboardEmpty) dashboardEmpty.hidden = any;
+}
+
+// Format a Date as a plain YYYY-MM-DD string (local calendar sense). The server
+// interprets the value as a GMT+8 calendar date. We read the UTC fields of the
+// Date because preset math (below) builds a Date whose UTC clock IS the GMT+8
+// wall clock, so browser-local timezone never leaks into the bucket boundary.
+function dashboardYmd(d) {
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return y + "-" + m + "-" + day;
+}
+
+// Resolve the current period selection into {from, to} query params. Presets
+// map to from/to in GMT+8 terms (NOT browser-local) so preset windows line up
+// with the server's GMT+8 buckets: Past week => today-7d..today, Past month =>
+// today-30d, Past year => today-365d, where "today" is the current instant's
+// GMT+8 calendar day. 'All' omits `from` (server uses the earliest event) and
+// omits `to` (server defaults to today). 'Custom' uses the From/To date inputs
+// verbatim (either may be blank).
+function dashboardPeriodParams() {
+  const period = dashboardPeriod ? dashboardPeriod.value : "all";
+  if (period === "custom") {
+    return {
+      from: dashboardFrom && dashboardFrom.value ? dashboardFrom.value : null,
+      to: dashboardTo && dashboardTo.value ? dashboardTo.value : null,
+    };
+  }
+  if (period === "all") {
+    return { from: null, to: null };
+  }
+  const days = period === "week" ? 7 : (period === "year" ? 365 : 30);
+  // Shift the current UTC instant by +8h so the Date's UTC fields spell out the
+  // GMT+8 wall-clock date; offset math then uses UTC day arithmetic (immune to
+  // the browser's local zone) and dashboardYmd reads the UTC fields back out.
+  const nowGmt8 = new Date(Date.now() + 8 * 60 * 60 * 1000);
+  const to = new Date(nowGmt8.getTime());
+  const from = new Date(nowGmt8.getTime());
+  from.setUTCDate(from.getUTCDate() - days);
+  return { from: dashboardYmd(from), to: dashboardYmd(to) };
+}
+
+// Show the From/To date inputs only for the Custom period, via [hidden].
+function syncDashboardCustomVisibility() {
+  if (!dashboardCustomRange) return;
+  const isCustom = dashboardPeriod && dashboardPeriod.value === "custom";
+  dashboardCustomRange.hidden = !isCustom;
+}
+
+async function loadDashboard() {
+  const sel = dashboardPeriodParams();
+  const params = [];
+  if (sel.from) params.push("from=" + encodeURIComponent(sel.from));
+  if (sel.to) params.push("to=" + encodeURIComponent(sel.to));
+  const qs = params.length ? "?" + params.join("&") : "";
+  try {
+    const res = await fetch("/api/dashboard" + qs, {
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) {
+      showNetworkError("Could not load your dashboard. Please try again.");
+      return;
+    }
+    const data = await res.json();
+    renderDashboard(data);
+  } catch (e) {
+    showNetworkError("Could not load your dashboard. Please try again.");
+  }
+}
+
+function openDashboard() {
+  if (dashboardOverlay) dashboardOverlay.hidden = false;
+  syncDashboardCustomVisibility();
+  loadDashboard();
+}
+function closeDashboard() {
+  if (dashboardOverlay) dashboardOverlay.hidden = true;
+}
+if (dashboardBtn) dashboardBtn.addEventListener("click", openDashboard);
+if (dashboardClose) dashboardClose.addEventListener("click", closeDashboard);
+if (dashboardApply) dashboardApply.addEventListener("click", loadDashboard);
+if (dashboardPeriod) dashboardPeriod.addEventListener("change", () => {
+  syncDashboardCustomVisibility();
+  // Presets reload immediately; Custom waits for the player to pick dates and
+  // press Apply (or change a date input).
+  if (dashboardPeriod.value !== "custom") loadDashboard();
+});
+if (dashboardFrom) dashboardFrom.addEventListener("change", loadDashboard);
+if (dashboardTo) dashboardTo.addEventListener("change", loadDashboard);
+
 // time-control radios toggle the h/m/s inputs
 const tcRadios = document.querySelectorAll('input[name="tc"]');
 for (let i = 0; i < tcRadios.length; i++) tcRadios[i].addEventListener("change", syncTcInputs);
+
+// mode radios toggle the Casual-only custom-position fieldset
+const modeRadios = document.querySelectorAll('input[name="mode"]');
+for (let i = 0; i < modeRadios.length; i++) modeRadios[i].addEventListener("change", syncCustomVisibility);
+if (customEnable) customEnable.addEventListener("change", () => {
+  if (customBody) customBody.hidden = !customEnable.checked;
+});
+if (openEditorBtn) openEditorBtn.addEventListener("click", openEditor);
+if (editorUseBtn) editorUseBtn.addEventListener("click", useEditorPosition);
+if (editorCancelBtn) editorCancelBtn.addEventListener("click", closeEditor);
+if (editorClearBtn) editorClearBtn.addEventListener("click", () => {
+  editorPieces = {}; renderEditorBoard();
+});
 
 wireDisclosure(settingsToggle, settingsBody);
 wireDisclosure(advancedToggle, advancedBody);
@@ -1190,6 +1705,405 @@ async function renderStartPosition() {
   renderAll();
 }
 
+// =========================================================================
+// Train view (FEAT-008): puzzle solving.
+//
+// Self-contained so it never perturbs the live-game state machine above. It
+// reuses the shared FEN parser + GLYPHS + .board/.square/.piece rendering and
+// the 8-color palette, and honors the bot-move animation invariant: the
+// opponent's auto-reply renders the intermediate position (the solver's move
+// landed) BEFORE sliding the opponent piece.
+// =========================================================================
+const trainTab = document.getElementById("trainTab");
+const trainView = document.getElementById("trainView");
+const trainBoardEl = document.getElementById("trainBoard");
+const trainTurnEl = document.getElementById("trainTurn");
+const trainStatusEl = document.getElementById("trainStatus");
+const trainHintEl = document.getElementById("trainHint");
+const trainNextBtn = document.getElementById("trainNext");
+const puzzleRatingLabel = document.getElementById("puzzleRatingLabel");
+const playerPuzzleRating = document.getElementById("playerPuzzleRating");
+
+let trainActive = false;
+let puzzle = null;          // {id, fen, solver_color, displayed_rating, ...}
+let puzzleFen = null;       // current FEN of the puzzle position
+let puzzleNextIndex = null; // next solver ply index to submit (null => done)
+let puzzleSolverColor = "white";
+let puzzleBusy = false;
+let puzzleSelected = null;
+let puzzleLegalNote = false; // when true, board is frozen (solved/failed)
+
+function trainOrientation() {
+  const flipped = puzzleSolverColor === "black";
+  const files = [0,1,2,3,4,5,6,7], ranks = [8,7,6,5,4,3,2,1];
+  return {
+    fileOrder: flipped ? [...files].reverse() : files,
+    rankOrder: flipped ? [...ranks].reverse() : ranks,
+  };
+}
+
+function renderTrainBoard(highlight) {
+  if (!trainBoardEl) return;
+  trainBoardEl.innerHTML = "";
+  const pieces = puzzleFen ? parseFen(puzzleFen) : {};
+  const { fileOrder, rankOrder } = trainOrientation();
+  const hFrom = highlight ? highlight.slice(0,2) : null;
+  const hTo = highlight ? highlight.slice(2,4) : null;
+  for (const rank of rankOrder) {
+    for (const file of fileOrder) {
+      const name = squareName(file, rank);
+      const sq = document.createElement("div");
+      sq.className = "square " + (isLightSquare(file, rank) ? "light" : "dark");
+      sq.dataset.square = name;
+      if (name === puzzleSelected) sq.classList.add("selected");
+      if (name === hFrom || name === hTo) sq.classList.add("last-move");
+      if (file === fileOrder[0]) {
+        const c = document.createElement("span"); c.className = "coord rank";
+        c.textContent = rank; sq.appendChild(c);
+      }
+      if (rank === rankOrder[rankOrder.length - 1]) {
+        const c = document.createElement("span"); c.className = "coord file";
+        c.textContent = String.fromCharCode(97 + file); sq.appendChild(c);
+      }
+      const p = pieces[name];
+      if (p) {
+        const span = document.createElement("span");
+        span.className = "piece " + (p === p.toUpperCase() ? "white" : "black");
+        span.textContent = GLYPHS[p];
+        sq.appendChild(span);
+      }
+      sq.addEventListener("click", () => onTrainSquareClick(name));
+      trainBoardEl.appendChild(sq);
+    }
+  }
+}
+
+// Apply a UCI move to a FEN string locally (piece move + captures + castling
+// rook shift + en-passant capture + promotion). Sufficient for rendering the
+// puzzle line; the SERVER remains the source of truth for validity.
+function applyUciToFen(fen, uci) {
+  const pieces = parseFen(fen);
+  const from = uci.slice(0,2), to = uci.slice(2,4);
+  const promo = uci.length > 4 ? uci[4] : null;
+  const moving = pieces[from];
+  if (!moving) return fen;
+  const isWhite = moving === moving.toUpperCase();
+  // En passant: a pawn moving diagonally onto an empty square captures the
+  // pawn behind the target square.
+  if (moving.toLowerCase() === "p" && from[0] !== to[0] && !pieces[to]) {
+    const capRank = to[1] === "6" ? "5" : (to[1] === "3" ? "4" : null);
+    if (capRank) delete pieces[to[0] + capRank];
+  }
+  delete pieces[from];
+  let placed = moving;
+  if (promo) placed = isWhite ? promo.toUpperCase() : promo.toLowerCase();
+  pieces[to] = placed;
+  // Castling: king moved two files -> move the rook too.
+  if (moving.toLowerCase() === "k" && Math.abs(from.charCodeAt(0) - to.charCodeAt(0)) === 2) {
+    const rank = from[1];
+    if (to[0] === "g") { pieces["f" + rank] = pieces["h" + rank]; delete pieces["h" + rank]; }
+    else if (to[0] === "c") { pieces["d" + rank] = pieces["a" + rank]; delete pieces["a" + rank]; }
+  }
+  return fenFromPieces(pieces);
+}
+
+// Rebuild just the piece-placement field of a FEN from a {square: piece} map.
+// The remaining FEN fields are not needed for rendering, so we emit a minimal
+// placeholder tail.
+function fenFromPieces(pieces) {
+  const rowsOut = [];
+  for (let r = 8; r >= 1; r--) {
+    let row = "", empty = 0;
+    for (let f = 0; f < 8; f++) {
+      const p = pieces[String.fromCharCode(97 + f) + r];
+      if (p) { if (empty) { row += empty; empty = 0; } row += p; }
+      else empty += 1;
+    }
+    if (empty) row += empty;
+    rowsOut.push(row);
+  }
+  return rowsOut.join("/") + " w - - 0 1";
+}
+
+function setPuzzleBusy(on) {
+  puzzleBusy = on;
+  if (trainNextBtn) trainNextBtn.disabled = on;
+}
+
+function trainSquareCenter(square) {
+  const el = trainBoardEl.querySelector('[data-square="' + square + '"]');
+  if (!el) return null;
+  const r = el.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+// Slide a piece on the TRAIN board (mirrors animateSlide for the play board).
+function animateTrainSlide(from, to, cb) {
+  if (!CASettings || !CASettings.animations) { cb(); return; }
+  const fromSq = trainBoardEl.querySelector('[data-square="' + from + '"]');
+  const pieceEl = fromSq && fromSq.querySelector(".piece");
+  const a = trainSquareCenter(from), b = trainSquareCenter(to);
+  if (!pieceEl || !a || !b) { cb(); return; }
+  const dx = b.x - a.x, dy = b.y - a.y;
+  pieceEl.classList.add("sliding");
+  void pieceEl.offsetWidth;
+  pieceEl.style.transform = "translate(" + dx + "px," + dy + "px)";
+  let done = false;
+  const finish = () => { if (done) return; done = true; cb(); };
+  pieceEl.addEventListener("transitionend", finish, { once: true });
+  setTimeout(finish, ANIM_MS + 80);
+}
+
+function renderPuzzleRatings() {
+  if (puzzleRatingLabel) {
+    if (puzzle && puzzle.displayed_rating != null) {
+      puzzleRatingLabel.hidden = false;
+      puzzleRatingLabel.textContent = "(" + puzzle.displayed_rating + ")";
+    } else puzzleRatingLabel.hidden = true;
+  }
+  if (playerPuzzleRating) {
+    if (puzzle && puzzle.player_rating != null) {
+      playerPuzzleRating.hidden = false;
+      playerPuzzleRating.textContent = "(" + puzzle.player_rating + ")";
+    } else playerPuzzleRating.hidden = true;
+  }
+}
+
+function renderPuzzleTurn() {
+  if (!trainTurnEl) return;
+  if (!puzzle || puzzleLegalNote) { trainTurnEl.hidden = true; return; }
+  trainTurnEl.hidden = false;
+  trainTurnEl.textContent = (puzzleSolverColor === "white" ? "White" : "Black") + " to move";
+}
+
+async function loadPuzzle() {
+  setPuzzleBusy(true);
+  puzzleSelected = null;
+  puzzleLegalNote = false;
+  if (trainStatusEl) trainStatusEl.textContent = "Loading a puzzle\u2026";
+  if (trainHintEl) trainHintEl.hidden = true;
+  if (trainNextBtn) trainNextBtn.hidden = true;
+  try {
+    const res = await fetch("/api/puzzle");
+    if (!res.ok) { if (trainStatusEl) trainStatusEl.textContent = "Please sign in to train."; return; }
+    const data = await res.json();
+    puzzle = data.puzzle;
+    if (!puzzle) {
+      puzzleFen = null;
+      renderTrainBoard(null);
+      renderPuzzleRatings();
+      renderPuzzleTurn();
+      if (trainStatusEl) trainStatusEl.textContent = "No puzzles are available yet.";
+      return;
+    }
+    puzzleFen = puzzle.fen;
+    puzzleNextIndex = puzzle.next_index;
+    puzzleSolverColor = puzzle.solver_color;
+    renderTrainBoard(puzzle.setup_move || null);
+    renderPuzzleRatings();
+    renderPuzzleTurn();
+    if (trainStatusEl) trainStatusEl.textContent = "Your move.";
+    if (trainHintEl) trainHintEl.hidden = false;
+  } catch (e) {
+    if (trainStatusEl) trainStatusEl.textContent = "A network error occurred. Please try again.";
+  } finally {
+    setPuzzleBusy(false);
+  }
+}
+
+function onTrainSquareClick(name) {
+  if (puzzleBusy || !puzzle || puzzleLegalNote || puzzleNextIndex == null) return;
+  const pieces = parseFen(puzzleFen);
+  if (puzzleSelected) {
+    if (name === puzzleSelected) { puzzleSelected = null; renderTrainBoard(null); return; }
+    // Attempt a move from the selected square to this one.
+    const fromPiece = pieces[puzzleSelected];
+    if (fromPiece) { attemptPuzzleMove(puzzleSelected, name, fromPiece); return; }
+  }
+  // Only allow picking up the solver's own pieces.
+  const p = pieces[name];
+  if (p) {
+    const isWhite = p === p.toUpperCase();
+    if ((puzzleSolverColor === "white") === isWhite) {
+      puzzleSelected = name; renderTrainBoard(null); return;
+    }
+  }
+  puzzleSelected = null; renderTrainBoard(null);
+}
+
+function puzzleNeedsPromotion(fromPiece, toSquare) {
+  if (!fromPiece || fromPiece.toLowerCase() !== "p") return false;
+  const r = parseInt(toSquare[1], 10);
+  return r === 8 || r === 1;
+}
+
+function attemptPuzzleMove(from, to, fromPiece) {
+  if (puzzleNeedsPromotion(fromPiece, to)) {
+    askPromotion((promo) => {
+      if (!promo) { puzzleSelected = null; renderTrainBoard(null); return; }
+      submitPuzzleMove(from + to + promo);
+    });
+    return;
+  }
+  submitPuzzleMove(from + to);
+}
+
+async function submitPuzzleMove(uci) {
+  if (puzzleBusy || puzzleNextIndex == null) return;
+  const submittedIndex = puzzleNextIndex;
+  const from = uci.slice(0,2), to = uci.slice(2,4);
+  puzzleSelected = null;
+  setPuzzleBusy(true);
+  try {
+    const res = await fetch("/api/puzzle/move", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ move: uci, index: submittedIndex }),
+    });
+    if (!res.ok) { if (trainStatusEl) trainStatusEl.textContent = "Please sign in to train."; return; }
+    const data = await res.json();
+    if (data.correct) {
+      // Render the solver's own move first.
+      puzzleFen = applyUciToFen(puzzleFen, uci);
+      renderTrainBoard(uci);
+      if (data.solved && data.opponent_move == null) {
+        finishPuzzle(true, data.puzzle_rating);
+        return;
+      }
+      if (data.opponent_move) {
+        // Bot-move animation invariant: intermediate position (solver's move
+        // already landed, rendered above) is shown BEFORE sliding the
+        // opponent reply.
+        const oppFrom = data.opponent_move.slice(0,2);
+        const oppTo = data.opponent_move.slice(2,4);
+        animateTrainSlide(oppFrom, oppTo, () => {
+          puzzleFen = applyUciToFen(puzzleFen, data.opponent_move);
+          renderTrainBoard(data.opponent_move);
+          if (data.solved) {
+            finishPuzzle(true, data.puzzle_rating);
+          } else {
+            puzzleNextIndex = data.next_index;
+            renderPuzzleTurn();
+            if (trainStatusEl) trainStatusEl.textContent = "Correct! Keep going.";
+          }
+        });
+      }
+    } else {
+      // Wrong move: show the attempted move landing, then mark failed.
+      puzzleFen = applyUciToFen(puzzleFen, uci);
+      renderTrainBoard(uci);
+      finishPuzzle(false, data.puzzle_rating);
+    }
+  } catch (e) {
+    if (trainStatusEl) trainStatusEl.textContent = "A network error occurred. Please try again.";
+  } finally {
+    setPuzzleBusy(false);
+  }
+}
+
+function finishPuzzle(solved, newRating) {
+  puzzleLegalNote = true;
+  puzzleNextIndex = null;
+  if (puzzle && newRating != null) puzzle.player_rating = newRating;
+  renderPuzzleRatings();
+  renderPuzzleTurn();
+  if (trainStatusEl) {
+    trainStatusEl.textContent = solved
+      ? ("Solved! Your puzzle rating is now " + newRating + ".")
+      : ("Failed. Your puzzle rating is now " + newRating + ".");
+  }
+  if (trainHintEl) trainHintEl.hidden = true;
+  if (trainNextBtn) trainNextBtn.hidden = false;
+}
+
+function showTrainView() {
+  trainActive = true;
+  if (trainView) trainView.hidden = false;
+  const playMain = document.querySelector("main.layout:not(.train-layout)");
+  if (playMain) playMain.hidden = true;
+  if (trainTab) trainTab.setAttribute("aria-pressed", "true");
+  loadPuzzle();
+}
+
+function hideTrainView() {
+  trainActive = false;
+  if (trainView) trainView.hidden = true;
+  const playMain = document.querySelector("main.layout:not(.train-layout)");
+  if (playMain) playMain.hidden = false;
+  if (trainTab) trainTab.setAttribute("aria-pressed", "false");
+}
+
+if (trainTab) trainTab.addEventListener("click", () => {
+  if (trainActive) hideTrainView(); else showTrainView();
+});
+if (trainNextBtn) trainNextBtn.addEventListener("click", () => { if (!puzzleBusy) loadPuzzle(); });
+
+// ---------------------------------------------------------------------------
+// Onboarding demo (FEAT-009; FEAT-001 follow-up): a brief, SKIPPABLE walkthrough
+// of the site's main features. NEW-USERS-ONLY: shown automatically (CFG.showDemo,
+// set by the server from the per-user demo_pending flag, which is TRUE only for
+// freshly-registered accounts) exactly once, right after account creation.
+// Pre-existing users NEVER see it, and it is NEVER re-shown on a version bump.
+// Stepping past the last slide, or Skip, marks the demo seen (POST /api/demo/seen),
+// which clears demo_pending so it is not shown again. Uses the [hidden] attribute
+// and the 8-color palette; declares no globals that clash with effects.js.
+// ---------------------------------------------------------------------------
+const demoOverlay = document.getElementById("demoOverlay");
+const demoSlides = demoOverlay
+  ? Array.prototype.slice.call(demoOverlay.querySelectorAll(".demo-slide"))
+  : [];
+const demoSkipBtn = document.getElementById("demoSkip");
+const demoNextBtn = document.getElementById("demoNext");
+const demoBackBtn = document.getElementById("demoBack");
+const demoProgress = document.getElementById("demoProgress");
+let demoIndex = 0;
+let demoSeenSent = false;
+
+function renderDemoSlide() {
+  for (let i = 0; i < demoSlides.length; i++) {
+    demoSlides[i].hidden = i !== demoIndex;
+  }
+  const last = demoIndex >= demoSlides.length - 1;
+  if (demoBackBtn) demoBackBtn.hidden = demoIndex === 0;
+  if (demoNextBtn) demoNextBtn.textContent = last ? "Finish" : "Next";
+  if (demoProgress) {
+    demoProgress.textContent = (demoIndex + 1) + " / " + demoSlides.length;
+  }
+}
+
+// Mark the demo seen so the server stops showing it (until the version bumps).
+// Best-effort: a network failure just means the demo may reappear next load.
+async function markDemoSeen() {
+  if (demoSeenSent) return;
+  demoSeenSent = true;
+  try {
+    await fetch("/api/demo/seen", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+    });
+  } catch (e) { /* non-fatal: demo can reappear on the next load */ }
+}
+
+function closeDemo() {
+  if (demoOverlay) demoOverlay.hidden = true;
+  markDemoSeen();
+}
+
+function openDemo() {
+  if (!demoOverlay || !demoSlides.length) return;
+  demoIndex = 0;
+  renderDemoSlide();
+  demoOverlay.hidden = false;
+}
+
+if (demoNextBtn) demoNextBtn.addEventListener("click", () => {
+  if (demoIndex >= demoSlides.length - 1) { closeDemo(); return; }
+  demoIndex += 1;
+  renderDemoSlide();
+});
+if (demoBackBtn) demoBackBtn.addEventListener("click", () => {
+  if (demoIndex > 0) { demoIndex -= 1; renderDemoSlide(); }
+});
+if (demoSkipBtn) demoSkipBtn.addEventListener("click", closeDemo);
+
 async function init() {
   wireSettings();
   const params = new URLSearchParams(window.location.search);
@@ -1199,5 +2113,8 @@ async function init() {
   await renderStartPosition();
   // If logged in, surface a Resume affordance (does NOT start the clock).
   if (CFG.loggedIn) { await refreshInProgress(); }
+  // Onboarding demo: new-users-only, shown once (server-gated via CFG.showDemo,
+  // which now reflects the per-user demo_pending flag).
+  if (CFG.loggedIn && CFG.showDemo) { openDemo(); }
 }
 init();

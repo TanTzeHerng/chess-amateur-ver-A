@@ -160,6 +160,45 @@ def glicko2_update(rating, rd, vol, opp_rating, opp_rd, score, tau=GLICKO2_TAU):
 
 
 # =========================================================================
+# Puzzle rating (Train tab) — reuses Glicko-2 with the PUZZLE as opponent.
+# =========================================================================
+
+# The player's PUZZLE rating starts at 1400 (per the feature spec), with the
+# standard Glicko-2 start RD/volatility. A puzzle is treated as an opponent at
+# its LICHESS rating; solving it is a win (score 1.0), failing it a loss (0.0).
+# The puzzle is a "known" difficulty, so like Chess Amateur's fixed rating we
+# treat it as a reliable opponent with a small RD.
+PLAYER_START_PUZZLE = 1400.0
+PUZZLE_OPPONENT_RD = 30.0
+
+# The DISPLAYED puzzle rating is the puzzle's Lichess rating minus this offset,
+# so a beginner-friendly curated puzzle shows an approachable number.
+PUZZLE_DISPLAY_OFFSET = 600
+
+
+def puzzle_displayed_rating(lichess_rating):
+    """Return the DISPLAYED puzzle rating = lichess_rating - 600.
+
+    This is the only place the 600-point offset lives; the internal bell-curve
+    selection and the Glicko-2 update both use the RAW lichess_rating."""
+    return int(lichess_rating) - PUZZLE_DISPLAY_OFFSET
+
+
+def puzzle_rating_update(rating, rd, vol, puzzle_lichess_rating, solved):
+    """Update the player's PUZZLE Glicko-2 rating after one puzzle.
+
+    Thin wrapper over glicko2_update documenting the puzzle-rating contract:
+    the PUZZLE is the opponent at its LICHESS rating (NOT the displayed
+    rating), treated as a reliable opponent (PUZZLE_OPPONENT_RD). `solved` True
+    is a win (score 1.0), False a loss (0.0). Returns
+    (new_rating, new_rd, new_vol, delta)."""
+    score = 1.0 if solved else 0.0
+    return glicko2_update(rating, rd, vol,
+                          float(puzzle_lichess_rating), PUZZLE_OPPONENT_RD,
+                          score)
+
+
+# =========================================================================
 # Convenience: score from a game result relative to the human's color.
 # =========================================================================
 

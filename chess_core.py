@@ -17,6 +17,7 @@ import os
 
 import chess
 
+import book
 from engine import ChessAmateurEngine, DEFAULT_THREADS, EngineUnavailable  # noqa: F401
 
 BOT_NAME = "Chess Amateur"
@@ -118,7 +119,7 @@ def canonical_reason(result, reason):
         return "%s won by checkmate" % winner
     if code == "resignation" and winner:
         return "%s won by resignation" % winner
-    if code in ("time forfeit", "time", "on time") and winner:
+    if code in ("time forfeit", "time", "on time", "timeout") and winner:
         return "%s won on time" % winner
 
     # Draw endings (phrased "Draw by ...").
@@ -163,13 +164,35 @@ class InvalidMoveHistory(ValueError):
     """Raised when a client/DB-supplied move list cannot be legally replayed."""
 
 
-def rebuild_board(moves):
-    """Replay a list of UCI moves onto a fresh board.
+class InvalidStartFen(ValueError):
+    """Raised when a custom start FEN cannot be parsed by python-chess."""
+
+
+def board_from_start_fen(start_fen):
+    """Build a fresh board from an optional custom start FEN.
+
+    None/empty -> the standard start position. A non-empty FEN is validated
+    with python-chess; an invalid FEN raises InvalidStartFen so the caller can
+    return a clear 400. This is the STATELESS custom-position anchor: the client
+    carries start_fen + moves and the server replays moves onto this board.
+    """
+    if not start_fen:
+        return chess.Board()
+    try:
+        return chess.Board(str(start_fen))
+    except (ValueError, TypeError) as exc:
+        raise InvalidStartFen("invalid FEN: %s" % (exc,))
+
+
+def rebuild_board(moves, start_fen=None):
+    """Replay a list of UCI moves onto a board (optionally a custom start FEN).
 
     Returns (board, san_history, moves_uci). python-chess validates every move;
-    an illegal continuation raises InvalidMoveHistory. Empty/None -> start pos.
+    an illegal continuation raises InvalidMoveHistory. Empty/None moves -> the
+    start position (standard, or `start_fen` when supplied). An invalid
+    `start_fen` raises InvalidStartFen.
     """
-    board = chess.Board()
+    board = board_from_start_fen(start_fen)
     san_history = []
     moves_uci = []
     if not moves:
@@ -207,13 +230,52 @@ def engine_move(board, threads=None):
     return uci, san
 
 
+def _apply_book_uci(board, uci):
+    """Validate + push a book UCI move. Returns (uci, san) or (None, None)."""
+    if not uci:
+        return None, None
+    try:
+        move = chess.Move.from_uci(uci)
+    except ValueError:
+        return None, None
+    if move not in board.legal_moves:
+        return None, None
+    san = board.san(move)
+    board.push(move)
+    return uci, san
+
+
+def reply_move(board, mode=None, threads=None, rng=None):
+    """Choose Chess Amateur's reply for the given mode, validate + push it.
+
+    FIDE-rated mode ONLY: first probe the Polyglot book (pc2500.bin); if the
+    position is in the book, play a weighted book move. Otherwise (not in book,
+    or any other mode) fall through to normal Stockfish depth-1 selection via
+    engine_move. Rated/Casual modes NEVER consult the book.
+
+    Book probing does NOT spawn an engine, preserving the single-process
+    invariant. `rng` is injectable so tests can make the weighted pick
+    deterministic. Returns (uci, san) or (None, None).
+    """
+    if mode == "fide":
+        uci = book.book_move(board, rng=rng)
+        if uci:
+            got_uci, san = _apply_book_uci(board, uci)
+            if got_uci:
+                return got_uci, san
+        # Not in book (or unusable) -> fall through to the engine.
+    return engine_move(board, threads=threads)
+
+
 def state_dict(board, human_color, threads, san_history, moves_uci,
-               game_id=None, last_bot_move=None, extra=None):
+               game_id=None, last_bot_move=None, extra=None, start_fen=None):
     """Serialize a position into the API state shape used by the frontend.
 
     `extra` merges additional keys (e.g. account/persistence fields) without
     the core needing to know about them. `moves` is the authoritative UCI
-    history the client echoes back on the next move.
+    history the client echoes back on the next move. `start_fen` is the custom
+    starting position (None for a standard game); the client echoes it back so
+    a custom-position game replays statelessly.
     """
     game_over = board.is_game_over(claim_draw=True)
     result = board.result(claim_draw=True) if game_over else None
@@ -228,6 +290,9 @@ def state_dict(board, human_color, threads, san_history, moves_uci,
         "status": status_str(board),
         "san_history": list(san_history),
         "moves": list(moves_uci),
+        # Custom starting position (None for a standard game). The client
+        # carries this back so the stateless replay anchors correctly.
+        "start_fen": start_fen,
         "bot_name": BOT_NAME,
         "last_bot_move": last_bot_move,
         "game_over": game_over,

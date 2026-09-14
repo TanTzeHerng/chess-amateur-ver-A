@@ -8,8 +8,15 @@
 </head>
 <body>
   <header class="topbar">
-    <h1>Play vs <span class="bot-name">{{ bot_name }}</span></h1>
+    <h1><span class="bot-name">{{ bot_name }}</span></h1>
     <nav class="account-nav" id="accountNav">
+      <!-- Train tab (FEAT-008): logged-in only. Sits to the LEFT of Settings
+           and switches to the puzzle-solving view (via the [hidden]
+           attribute). Guests have no puzzle rating, so the tab is account-only
+           (rated puzzles need a stored per-user Glicko-2 rating). -->
+      {% if user %}
+      <button type="button" class="navlink btnlink" id="trainTab" aria-pressed="false">Train</button>
+      {% endif %}
       <!-- Settings disclosure (collapsed by default). Relocated here from the
            panel; contains Animations, Sound effects and Advanced Settings. -->
       <div class="disclosure" id="settingsTab">
@@ -43,14 +50,16 @@
       </div>
 
       {% if user %}
-      <!-- Profile disclosure (logged-in only): My games + Logout. -->
+      <!-- Profile disclosure (logged-in only): My games + Logout + Delete account. -->
       <div class="disclosure" id="profileTab">
         <button type="button" class="disclosure-toggle" id="profileToggle" aria-expanded="false">
           Profile <span class="arrow">&#x25B8;</span>
         </button>
         <div class="disclosure-body" id="profileBody" hidden>
           <a class="navlink" href="{{ url_for('history_page') }}">My games</a>
+          <button id="dashboardBtn" type="button" class="navlink btnlink">Dashboard</button>
           <button id="logoutBtn" type="button" class="navlink btnlink">Logout</button>
+          <button id="deleteAccountBtn" type="button" class="navlink btnlink danger">Delete account</button>
         </div>
       </div>
       {% elif accounts_enabled %}
@@ -119,6 +128,22 @@
           {% endif %}
         </fieldset>
 
+        <!-- Custom position: Casual mode ONLY. Hidden (via [hidden]) unless
+             Casual is selected. Offers a pasted FEN OR a board editor that
+             produces + validates a FEN. -->
+        <fieldset class="custom-choice" id="customChoice" hidden>
+          <legend>Custom position</legend>
+          <label><input type="checkbox" id="customEnable" /> Start from a custom position (casual only)</label>
+          <div class="custom-body" id="customBody" hidden>
+            <div class="custom-fen-row">
+              <label for="customFen">FEN</label>
+              <input type="text" id="customFen" placeholder="rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1" />
+            </div>
+            <button id="openEditor" type="button" class="btn">Board editor&hellip;</button>
+            <p class="hint" id="customFenError" hidden></p>
+          </div>
+        </fieldset>
+
         <fieldset class="tc-choice">
           <legend>Time control</legend>
           <label><input type="radio" name="tc" value="custom" checked /> Custom</label>
@@ -175,11 +200,81 @@
     </aside>
   </main>
 
+  <!-- Train view (FEAT-008): puzzle-solving. Hidden by default via the
+       [hidden] attribute; the Train tab toggles it against the play view. It
+       reuses the same .board / .square / .piece rendering + 8-color palette. -->
+  <main class="layout train-layout" id="trainView" hidden>
+    <section class="board-area">
+      <div class="name-row">
+        <span class="player-name">Puzzle</span>
+        <span class="player-rating" id="puzzleRatingLabel" hidden></span>
+      </div>
+      <div class="train-turn" id="trainTurn" hidden></div>
+
+      <div class="board-wrap">
+        <div id="trainBoard" class="board" role="grid" aria-label="Puzzle board"></div>
+      </div>
+
+      <div class="name-row">
+        <span class="player-name">Your puzzle rating</span>
+        <span class="player-rating" id="playerPuzzleRating" hidden></span>
+      </div>
+    </section>
+
+    <aside class="panel">
+      <div class="train-panel">
+        <h2>Train</h2>
+        <p class="train-status" id="trainStatus">Loading a puzzle&hellip;</p>
+        <p class="hint" id="trainHint" hidden>Find the best move for the side to move.</p>
+        <button id="trainNext" type="button" class="btn" hidden>Next puzzle</button>
+      </div>
+    </aside>
+  </main>
+
   <!-- Promotion picker overlay -->
   <div id="promoOverlay" class="promo-overlay" hidden>
     <div class="promo-box">
       <p>Promote to:</p>
       <div class="promo-choices" id="promoChoices"></div>
+    </div>
+  </div>
+
+  <!-- Board editor overlay (Casual custom position). Uses [hidden] for
+       show/hide and the 8-color palette. Produces a validated FEN. -->
+  <div id="editorOverlay" class="editor-overlay" hidden>
+    <div class="editor-box">
+      <h2>Board editor</h2>
+      <div class="editor-layout">
+        <div class="editor-board" id="editorBoard"></div>
+        <div class="editor-side">
+          <div class="editor-palette" id="editorPalette"></div>
+          <p class="hint">Click a piece above, then click a square to place it. Pick <b>Erase</b> to clear a square.</p>
+          <fieldset class="editor-turn">
+            <legend>Side to move</legend>
+            <label><input type="radio" name="editorTurn" value="w" checked /> White</label>
+            <label><input type="radio" name="editorTurn" value="b" /> Black</label>
+          </fieldset>
+          <fieldset class="editor-castling">
+            <legend>Castling rights</legend>
+            <label><input type="checkbox" id="castWK" checked /> White O-O (K)</label>
+            <label><input type="checkbox" id="castWQ" checked /> White O-O-O (Q)</label>
+            <label><input type="checkbox" id="castBK" checked /> Black O-O (k)</label>
+            <label><input type="checkbox" id="castBQ" checked /> Black O-O-O (q)</label>
+          </fieldset>
+          <div class="editor-fields">
+            <label for="editorEp">En passant target</label>
+            <input type="text" id="editorEp" placeholder="- (e.g. e3)" value="-" />
+            <label for="editorHalfmove">Halfmove clock</label>
+            <input type="number" id="editorHalfmove" min="0" value="0" />
+          </div>
+          <p class="hint" id="editorError" hidden></p>
+          <div class="editor-actions">
+            <button id="editorUse" type="button" class="btn">Use this position</button>
+            <button id="editorClear" type="button" class="btn">Clear board</button>
+            <button id="editorCancel" type="button" class="btn">Cancel</button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -191,6 +286,114 @@
     </div>
   </div>
 
+  <!-- Delete-account confirmation overlay (explicit intent, palette-styled).
+       Uses the [hidden] attribute like the other overlays; NOT window.confirm. -->
+  <div id="deleteAccountOverlay" class="confirm-overlay" hidden>
+    <div class="confirm-box">
+      <p>Delete your account permanently? This also deletes all of your games and cannot be undone.</p>
+      <div class="confirm-actions">
+        <button id="deleteAccountConfirm" type="button" class="btn btn-danger">Delete my account</button>
+        <button id="deleteAccountCancel" type="button" class="btn">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dashboard overlay (FEAT-010; FEAT-002 follow-up): line graphs of the
+       player's gameplay (FIDE classes + Rated) and puzzle ratings over a
+       selectable period. The period selector offers EXACTLY: Past week (7d),
+       Past month (30d), Past year (365d), All (earliest event through today),
+       and Custom (reveals the From/To date inputs). Presets map to from/to
+       client-side; the server derives DAILY values at GMT+8 00:00 boundaries
+       (read-only) from the event-driven rating_history log. Uses the [hidden]
+       attribute like the other overlays; 8-color palette; the graphs are drawn
+       as inline SVG by app.js (no chart library). -->
+  <div id="dashboardOverlay" class="dashboard-overlay" hidden>
+    <div class="dashboard-box">
+      <div class="dashboard-head">
+        <h2>Ratings dashboard</h2>
+        <button id="dashboardClose" type="button" class="btn">Close</button>
+      </div>
+      <div class="dashboard-range">
+        <label for="dashboardPeriod">Period</label>
+        <select id="dashboardPeriod">
+          <option value="week">Past week</option>
+          <option value="month" selected>Past month</option>
+          <option value="year">Past year</option>
+          <option value="all">All</option>
+          <option value="custom">Custom</option>
+        </select>
+        <span id="dashboardCustomRange" hidden>
+          <label for="dashboardFrom">From</label>
+          <input type="date" id="dashboardFrom" />
+          <label for="dashboardTo">To</label>
+          <input type="date" id="dashboardTo" />
+          <button id="dashboardApply" type="button" class="btn">Apply</button>
+        </span>
+      </div>
+      <p class="hint" id="dashboardEmpty" hidden>No rating history in this period yet. Play a rated/FIDE game or solve a puzzle to start building your graphs.</p>
+      <div class="dashboard-charts" id="dashboardCharts"></div>
+    </div>
+  </div>
+
+  <!-- Onboarding demo overlay (FEAT-009; FEAT-001 follow-up): a brief,
+       SKIPPABLE walkthrough of the site's main features. NEW-USERS-ONLY: shown
+       automatically only to a brand-new signup (server gates on the per-user
+       demo_pending flag via show_demo). Pre-existing users never see it and it
+       is never re-shown on a version bump. Uses the [hidden] attribute like the
+       other overlays and the 8-color palette. The slide text lives here; app.js
+       steps through the slides and calls POST /api/demo/seen on Skip or Finish,
+       which clears demo_pending so it is not shown again. -->
+  <div id="demoOverlay" class="demo-overlay" hidden>
+    <div class="demo-box">
+      <div class="demo-head">
+        <h2>Welcome to Chess Amateur</h2>
+        <button id="demoSkip" type="button" class="btn">Skip</button>
+      </div>
+      <div class="demo-slides">
+        <div class="demo-slide">
+          <h3>Playing modes</h3>
+          <p>Play in three modes: <b>Casual</b> for relaxed games with no rating
+             on the line, <b>Rated</b> for games that move your Chess Amateur
+             rating, and <b>FIDE</b> for competitive play seeded from your FIDE
+             rating.</p>
+        </div>
+        <div class="demo-slide" hidden>
+          <h3>FIDE mode is for serious play</h3>
+          <p>FIDE mode is meant for serious play because FIDE-rated games
+             generate statistical data about the player. Choose it when you want
+             your results to count toward your profile's statistics.</p>
+        </div>
+        <div class="demo-slide" hidden>
+          <h3>My Games &amp; collections</h3>
+          <p>Every account game is saved under <b>My Games</b>, where you can
+             replay, filter, and organize games into nestable <b>collections</b>.</p>
+        </div>
+        <div class="demo-slide" hidden>
+          <h3>Custom positions</h3>
+          <p>In Casual mode you can set up any position with the <b>board
+             editor</b> and start a game from there.</p>
+        </div>
+        <div class="demo-slide" hidden>
+          <h3>Train</h3>
+          <p>The <b>Train</b> tab serves rated tactics puzzles tuned to your
+             puzzle rating so you improve at the right level.</p>
+        </div>
+        <div class="demo-slide" hidden>
+          <h3>Dashboard</h3>
+          <p>The <b>Dashboard</b> charts your gameplay and puzzle ratings over
+             time so you can track your progress. That's it, enjoy!</p>
+        </div>
+      </div>
+      <div class="demo-foot">
+        <span class="demo-progress" id="demoProgress"></span>
+        <div class="demo-actions">
+          <button id="demoBack" type="button" class="btn" hidden>Back</button>
+          <button id="demoNext" type="button" class="btn">Next</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Flags for the frontend: whether a user is signed in (enables save/
        resume/resign + the one-active-game rule) and whether accounts exist. -->
   <script>
@@ -199,7 +402,9 @@
       loggedIn: {{ 'true' if user else 'false' }},
       accountsEnabled: {{ 'true' if accounts_enabled else 'false' }},
       defaultThreads: {{ default_threads | tojson }},
-      username: {{ (user.username if user else 'Guest') | tojson }}
+      username: {{ (user.username if user else 'Guest') | tojson }},
+      showDemo: {{ 'true' if show_demo else 'false' }},
+      demoVersion: {{ current_demo_version | tojson }}
     };
   </script>
   <script src="{{ url_for('static', filename='effects.js') }}"></script>

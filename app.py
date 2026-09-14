@@ -40,7 +40,22 @@ import ratings as R
 import timecontrol as TC
 import clockclient
 import eco
+import fide
+import puzzles as P
 from storage import Store
+
+# Default seed rating for any FIDE time control the player does not hold (or
+# when there is no FIDE ID / the scrape fails). Matches the users table default.
+FIDE_DEFAULT_RATING = 1400
+
+# FEAT-009 / follow-up FEAT-001: version tag for the onboarding demo content.
+# NOTE: the demo is now NEW-USERS-ONLY, gated by the per-user demo_pending flag
+# (set TRUE only at registration, cleared on POST /api/demo/seen). This constant
+# NO LONGER gates whether the demo is shown, and bumping it MUST NOT re-trigger
+# the demo for existing users. It is retained only as a harmless content tag
+# (still recorded in demo_seen_version for back-compat). The demo CONTENT lives
+# in the frontend (static/app.js); keep it BRIEF.
+CURRENT_DEMO_VERSION = 1
 
 app = Flask(__name__)
 
@@ -139,6 +154,9 @@ def _apply_result_and_rating(user, mode, human_color, base_seconds, increment,
         # (in _move_extra / the resign+in-progress responses) reports the NEW
         # rating, not the pre-game value the request read at start.
         user["fide_%s" % tclass] = new_rating
+        # FEAT-010: record the new FIDE-class rating on the dashboard series.
+        STORE.append_rating_history(
+            user["id"], "fide_%s" % tclass, new_rating, _now_iso())
         return R.format_delta(delta, suffix="FIDE %s" % tclass)
 
     # rated (Glicko-2)
@@ -150,7 +168,62 @@ def _apply_result_and_rating(user, mode, human_color, base_seconds, increment,
     user["rated_rating"] = new_r
     user["rated_rd"] = new_rd
     user["rated_vol"] = new_vol
+    # FEAT-010: record the new Rated rating on the dashboard series.
+    STORE.append_rating_history(user["id"], "rated", new_r, _now_iso())
     return R.format_delta(delta)
+
+
+def _player_rating_after(user, mode, base_seconds, increment):
+    """Return the player's rating AFTER a finished rated/FIDE game, for
+    persistence in games.player_rating_after (shown in My Games).
+
+    Call this AFTER _apply_result_and_rating, which refreshes the in-memory
+    user dict with the new rating; display_ratings then reports that post-game
+    value for the game's mode + time class. Returns None for casual/guest.
+    """
+    player_rating, _bot_rating = R.display_ratings(
+        user, mode, base_seconds, increment)
+    return player_rating
+
+
+def _seed_fide_ratings(user_id, fide_id, scraper=fide.lookup_ratings):
+    """Seed a newly-registered user's three FIDE ratings from their FIDE ID.
+
+    For each of classical/rapid/blitz: use the scraped rating when present,
+    else default to 1400. Stores the fide_id on the user. NEVER blocks signup:
+    any scrape failure (bad id, network error, unparseable page) yields all
+    three at 1400. ``scraper`` is injectable so tests can stub the network.
+
+    Returns the seeded {classical, rapid, blitz} dict actually written.
+    """
+    if fide_id:
+        STORE.set_fide_id(user_id, fide_id)
+    ratings = {"classical": None, "rapid": None, "blitz": None}
+    if fide_id:
+        try:
+            scraped = scraper(fide_id) or {}
+        except Exception:
+            scraped = {}
+        for k in ratings:
+            ratings[k] = scraped.get(k)
+    seeded = {}
+    for tclass in ("classical", "rapid", "blitz"):
+        value = ratings.get(tclass)
+        rating = value if value is not None else FIDE_DEFAULT_RATING
+        seeded[tclass] = rating
+        STORE.update_fide_rating(user_id, tclass, rating)
+    return seeded
+
+
+def _clean_fide_id(value):
+    """Normalize a submitted FIDE ID to a digit string, or None. Rejects
+    anything with non-digit content so a typo does not trigger a bogus scrape."""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    return s if s.isdigit() else None
 
 
 # ==========================================================================
@@ -160,12 +233,20 @@ def _apply_result_and_rating(user, mode, human_color, base_seconds, increment,
 @app.get("/")
 def index():
     user = _current_user()
+    # FEAT-001 (follow-up): the onboarding demo is NEW-USERS-ONLY. Show it only
+    # when the logged-in user still has demo_pending set (TRUE only for freshly
+    # registered accounts, cleared once the demo is dismissed). Pre-existing /
+    # migrated accounts default to False, and guests (user is None) never see
+    # it. A CURRENT_DEMO_VERSION bump does NOT re-trigger it.
+    show_demo = bool(user) and user.get("demo_pending", False)
     return render_template(
         "index.html",
         bot_name=core.BOT_NAME,
         user=user,
         accounts_enabled=STORE.enabled,
         default_threads=core.DEFAULT_GAME_THREADS,
+        show_demo=show_demo,
+        current_demo_version=CURRENT_DEMO_VERSION,
     )
 
 
@@ -191,8 +272,14 @@ def history_page():
     if not user:
         return redirect(url_for("login_page"))
     games = STORE.list_games(user["id"])
+    collections = STORE.list_collections(user["id"])
+    game_collections = STORE.list_game_collection_ids(user["id"])
+    # Embed each game's collection membership so the tree UI can filter without
+    # an extra round-trip. Keys are strings once JSON-encoded in the template.
+    for g in games:
+        g["collections"] = game_collections.get(g["id"], [])
     return render_template("history.html", bot_name=core.BOT_NAME,
-                           user=user, games=games)
+                           user=user, games=games, collections=collections)
 
 
 # ==========================================================================
@@ -205,9 +292,27 @@ def api_register():
         return jsonify({"error": "Accounts are unavailable right now."}), 503
     data = request.get_json(silent=True) or {}
     user, err = auth.register_user(STORE, data.get("username"),
-                                   data.get("password"))
+                                   data.get("password"),
+                                   email=data.get("email"))
     if err:
         return jsonify({"error": err}), 400
+    # FEAT-001 (follow-up): the onboarding demo is NEW-USERS-ONLY. Mark the demo
+    # as pending for this freshly-registered account (both the bcrypt-local and
+    # Supabase paths return through here). Pre-existing / migrated rows keep the
+    # migration default False, so they are NEVER shown the demo. Never set on
+    # login. Best-effort: a storage hiccup must not block signup.
+    try:
+        STORE.set_demo_pending(user["id"], True)
+    except Exception:  # pragma: no cover - defensive; demo flag is non-critical
+        app.logger.warning("Failed to set demo_pending for user %s", user["id"])
+    # Seed FIDE ratings from an optional FIDE ID (present -> scraped value,
+    # absent/unrated -> 1400). Never blocks signup on a scrape failure.
+    fide_id = _clean_fide_id(data.get("fide_id"))
+    if fide_id:
+        try:
+            _seed_fide_ratings(user["id"], fide_id)
+        except Exception:  # pragma: no cover - defensive; seeding is best-effort
+            app.logger.warning("FIDE seeding failed for user %s", user["id"])
     session.clear()
     session["uid"] = user["id"]
     return jsonify({"user": user})
@@ -233,6 +338,372 @@ def api_logout():
     return jsonify({"ok": True})
 
 
+@app.post("/api/forgot-password")
+def api_forgot_password():
+    """Trigger a password-reset email via Supabase (which sends the email).
+
+    Delegates entirely to Supabase Auth when configured. When Supabase is
+    unconfigured (bcrypt-local mode) this is a clear no-op: there is no email
+    delivery in the local path, so we return a 501 with a plain message rather
+    than pretending. Never reveals whether an account exists when configured.
+    """
+    if not auth.supabase_configured():
+        return jsonify({
+            "error": "Password reset by email is unavailable on this server."
+        }), 501
+    data = request.get_json(silent=True) or {}
+    identifier = (data.get("email") or data.get("username") or "").strip()
+    if not identifier:
+        return jsonify({"error": "Enter your username or email."}), 400
+    redirect_to = data.get("redirect_to")
+    ok, err = auth.send_password_reset(identifier, redirect_to=redirect_to)
+    if not ok:
+        return jsonify({"error": err or "Password reset is unavailable."}), 503
+    # Uniform success response (does not leak whether the account exists).
+    return jsonify({"ok": True,
+                    "message": "If that account exists, a reset email is on its way."})
+
+
+@app.post("/api/delete-account")
+def api_delete_account():
+    """Delete the logged-in user's account and all of their games.
+
+    Requires an authenticated session (401 otherwise). The client confirms
+    intent before calling this. Games are removed via the ON DELETE CASCADE FK
+    (and explicitly by delete_user for SQLite). The session is cleared on
+    success so the (now non-existent) user is logged out.
+    """
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    # If Supabase owns identity, also delete the Supabase auth user (service
+    # key). Guarded: a no-op when Supabase/service key is unconfigured, so
+    # local (bcrypt) deletion keeps working unchanged. Look up the linked
+    # Supabase id BEFORE removing the local row.
+    if auth.supabase_admin_configured():
+        try:
+            row = STORE._execute(
+                "SELECT supabase_user_id FROM users WHERE id = %s"
+                % STORE._placeholder(), (user["id"],), fetch="one")
+            sb_uid = row[0] if row else None
+            if sb_uid:
+                auth.delete_supabase_user(sb_uid)
+        except Exception:  # pragma: no cover - never block local deletion
+            app.logger.warning("Supabase user deletion failed for %s",
+                               user["id"])
+    STORE.delete_user(user["id"])
+    session.clear()
+    return jsonify({"ok": True})
+
+
+# ==========================================================================
+# Onboarding demo API (FEAT-009)
+# ==========================================================================
+
+@app.get("/api/demo")
+def api_demo():
+    """Return whether the logged-in user should be shown the onboarding demo.
+
+    Requires an authenticated session (401 otherwise). FEAT-001 (follow-up):
+    `show` is driven by the per-user demo_pending flag (TRUE only for freshly
+    registered accounts, cleared on POST /api/demo/seen), so the demo is shown
+    EXACTLY ONCE and NEVER re-shown on a version bump. The current_version /
+    seen_version fields are kept for back-compat only.
+    """
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    return jsonify({
+        "current_version": CURRENT_DEMO_VERSION,
+        "seen_version": user.get("demo_seen_version", 0),
+        "show": user.get("demo_pending", False),
+    })
+
+
+@app.post("/api/demo/seen")
+def api_demo_seen():
+    """Mark the onboarding demo as seen for the logged-in user.
+
+    FEAT-001 (follow-up): clears the one-shot demo_pending flag so the demo is
+    NEVER shown again (new-users-only). Also bumps demo_seen_version for
+    back-compat (harmless; it no longer gates showing the demo). Requires an
+    authenticated session (401 otherwise).
+    """
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    STORE.set_demo_pending(user["id"], False)
+    STORE.set_demo_seen_version(user["id"], CURRENT_DEMO_VERSION)
+    return jsonify({"ok": True, "seen_version": CURRENT_DEMO_VERSION})
+
+
+# ==========================================================================
+# Collections API (FEAT-006) -- organize My Games into nestable folders.
+#
+# Every endpoint requires an authenticated session (401 otherwise) and the
+# storage layer enforces that the target collection/game belongs to the
+# logged-in user (so a user can never read or modify another user's folders).
+#
+# Request/response contracts:
+#   GET    /api/collections
+#       -> 200 {"collections": [ {id, parent_id, name, created_at}, ... ]}
+#          Flat rows for the user; the client assembles the tree via parent_id.
+#   POST   /api/collections            {name, parent_id?}
+#       -> 200 {"collection": {id, parent_id, name}}  on success
+#       -> 400 {"error": ...} for a missing name or a parent_id the user does
+#          not own.
+#   PATCH  /api/collections/<id>       {name}   (POST is accepted as an alias)
+#       -> 200 {"ok": true} | 404 {"error": ...} if not owned / not found.
+#   DELETE /api/collections/<id>
+#       -> 200 {"ok": true} (cascades subfolders + memberships) | 404.
+#   POST   /api/collections/<id>/games {game_id}
+#       -> 200 {"ok": true} | 400 {"error": ...} if the collection or game is
+#          not owned by the user.
+#   DELETE /api/collections/<id>/games/<game_id>
+#       -> 200 {"ok": true} | 404 {"error": ...} if the membership was absent
+#          or not owned.
+# ==========================================================================
+
+@app.get("/api/collections")
+def api_list_collections():
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    return jsonify({"collections": STORE.list_collections(user["id"])})
+
+
+@app.post("/api/collections")
+def api_create_collection():
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "A collection name is required."}), 400
+    parent_id = data.get("parent_id")
+    cid = STORE.create_collection(user["id"], name, parent_id=parent_id)
+    if cid is None:
+        return jsonify({"error": "Could not create the collection."}), 400
+    return jsonify({"collection": {"id": cid, "parent_id": parent_id,
+                                   "name": name}})
+
+
+@app.route("/api/collections/<int:collection_id>", methods=["PATCH", "POST"])
+def api_rename_collection(collection_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "A collection name is required."}), 400
+    if not STORE.rename_collection(user["id"], collection_id, name):
+        return jsonify({"error": "Collection not found."}), 404
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/collections/<int:collection_id>")
+def api_delete_collection(collection_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    if not STORE.delete_collection(user["id"], collection_id):
+        return jsonify({"error": "Collection not found."}), 404
+    return jsonify({"ok": True})
+
+
+@app.post("/api/collections/<int:collection_id>/games")
+def api_add_game_to_collection(collection_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    data = request.get_json(silent=True) or {}
+    game_id = data.get("game_id")
+    if game_id is None:
+        return jsonify({"error": "A game_id is required."}), 400
+    if not STORE.add_game_to_collection(user["id"], collection_id, game_id):
+        return jsonify({"error": "Could not add the game to that collection."}), 400
+    return jsonify({"ok": True})
+
+
+@app.delete("/api/collections/<int:collection_id>/games/<int:game_id>")
+def api_remove_game_from_collection(collection_id, game_id):
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    if not STORE.remove_game_from_collection(user["id"], collection_id, game_id):
+        return jsonify({"error": "Membership not found."}), 404
+    return jsonify({"ok": True})
+
+
+# ==========================================================================
+# Puzzle API (Train tab, FEAT-008)
+#
+# A logged-in user has ONE currently-assigned puzzle, persisted on their row
+# (users.assigned_puzzle_id) so a page reload shows the SAME puzzle until it is
+# solved or failed. Puzzles come from the curated `puzzles` table (FEAT-007).
+#
+# Lichess puzzle format: `fen` is the position BEFORE the opponent's setup
+# move; `moves` is the space-separated UCI line where moves[0] is the
+# opponent's setup move and the SOLVER plays moves at odd indices (1, 3, 5...).
+# We validate the solver's move with python-chess against the known solution
+# (NO engine needed -> the single-Stockfish invariant is preserved).
+#
+#   GET  /api/puzzle
+#       -> 200 {"puzzle": {id, fen, solver_color, displayed_rating,
+#                          rating (player puzzle rating), ...}} (assigns one via
+#          the bell-curve sampler if none is assigned, and persists it). The
+#          SOLUTION moves are NOT returned up front.
+#       -> 200 {"puzzle": null, ...} if there are no curated puzzles.
+#       -> 401 if not signed in.
+#   POST /api/puzzle/move   {move: "e2e4", index: <solver ply index>}
+#       -> 200 with the outcome of the submitted move. On a wrong move the
+#          puzzle is FAILED; on the last correct solver move it is SOLVED. In
+#          both terminal cases the puzzle Glicko-2 rating updates vs the
+#          puzzle's LICHESS rating, the assignment is cleared, and the new
+#          puzzle rating is returned. A correct-but-not-final move returns the
+#          opponent's auto-reply so the client can animate it.
+#       -> 401 if not signed in.
+# ==========================================================================
+
+
+def _puzzle_public(puzzle, user):
+    """Public puzzle payload for the client. Includes the position AFTER the
+    opponent's setup move (the position the solver actually sees), the solver's
+    color, and the DISPLAYED rating (lichess - 600). Does NOT include the
+    solution moves."""
+    import chess
+    board = chess.Board(puzzle["fen"])
+    setup = puzzle["moves"][0]
+    board.push(chess.Move.from_uci(setup))
+    return {
+        "id": puzzle["id"],
+        # Position the solver is presented with (after the opponent's setup
+        # move) plus the raw setup move so the client can animate it in.
+        "fen": board.fen(),
+        "setup_fen": puzzle["fen"],
+        "setup_move": setup,
+        "solver_color": "white" if board.turn == chess.WHITE else "black",
+        "turn": "white" if board.turn == chess.WHITE else "black",
+        # First solver ply the client should submit (index 1 in the UCI line).
+        "next_index": 1,
+        "displayed_rating": R.puzzle_displayed_rating(puzzle["lichess_rating"]),
+        "player_rating": round(float(user["puzzle_rating"])),
+    }
+
+
+def _assign_puzzle(user):
+    """Pick a puzzle via the bell-curve sampler and persist it as the user's
+    current assignment. Returns the puzzle dict, or None if the curated table
+    is empty."""
+    extent = STORE.puzzle_rating_extent()
+    if extent[0] is None:
+        return None
+    puzzle = P.sample_puzzle(
+        float(user["puzzle_rating"]),
+        fetch_band=lambda low, high: STORE.fetch_puzzles_in_rating_band(
+            low, high, limit=50),
+        extent=extent)
+    if puzzle is None:
+        return None
+    STORE.set_assigned_puzzle(user["id"], puzzle["id"])
+    return puzzle
+
+
+@app.get("/api/puzzle")
+def api_puzzle():
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    puzzle = STORE.get_assigned_puzzle(user["id"])
+    if puzzle is None:
+        puzzle = _assign_puzzle(user)
+    if puzzle is None:
+        return jsonify({"puzzle": None,
+                        "player_rating": round(float(user["puzzle_rating"]))})
+    return jsonify({"puzzle": _puzzle_public(puzzle, user),
+                    "player_rating": round(float(user["puzzle_rating"]))})
+
+
+def _finish_puzzle(user, puzzle, solved):
+    """Update the player's puzzle Glicko-2 rating vs the puzzle's LICHESS
+    rating (win if solved, loss if failed), clear the assignment, and return
+    the new (rounded) puzzle rating."""
+    new_r, new_rd, new_vol, _delta = R.puzzle_rating_update(
+        user["puzzle_rating"], user["puzzle_rd"], user["puzzle_vol"],
+        puzzle["lichess_rating"], solved)
+    STORE.update_puzzle_rating(user["id"], new_r, new_rd, new_vol)
+    STORE.set_assigned_puzzle(user["id"], None)
+    # Refresh the in-memory user so a follow-up read sees the new rating.
+    user["puzzle_rating"] = new_r
+    user["puzzle_rd"] = new_rd
+    user["puzzle_vol"] = new_vol
+    # FEAT-010: record the new puzzle rating on the dashboard series.
+    STORE.append_rating_history(user["id"], "puzzle", new_r, _now_iso())
+    return round(float(new_r))
+
+
+@app.post("/api/puzzle/move")
+def api_puzzle_move():
+    import chess
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    data = request.get_json(silent=True) or {}
+    move_uci = data.get("move")
+    puzzle = STORE.get_assigned_puzzle(user["id"])
+    if puzzle is None:
+        return jsonify({"error": "No puzzle assigned."}), 400
+
+    line = puzzle["moves"]
+    try:
+        index = int(data.get("index", 1))
+    except (TypeError, ValueError):
+        index = 1
+    # The solver plays at odd indices (1, 3, 5, ...); index 0 is the opponent's
+    # setup move. Anything else is a bad request.
+    if index < 1 or index % 2 == 0 or index >= len(line):
+        return jsonify({"error": "Invalid solver move index."}), 400
+
+    expected = line[index]
+    correct = bool(move_uci) and (str(move_uci) == expected)
+
+    if not correct:
+        # Wrong move -> puzzle FAILED. Rating drops vs the puzzle's rating.
+        new_rating = _finish_puzzle(user, puzzle, solved=False)
+        return jsonify({
+            "correct": False, "solved": False, "failed": True,
+            "expected": expected,
+            "puzzle_rating": new_rating,
+        })
+
+    # Correct solver move. Is there an opponent reply after it (index+1)?
+    reply_index = index + 1
+    if reply_index >= len(line):
+        # No further moves -> the puzzle is fully SOLVED.
+        new_rating = _finish_puzzle(user, puzzle, solved=True)
+        return jsonify({
+            "correct": True, "solved": True, "failed": False,
+            "puzzle_rating": new_rating,
+        })
+
+    # Auto-play the opponent's reply and hand the client the next solver index.
+    reply = line[reply_index]
+    next_index = reply_index + 1
+    done = next_index >= len(line)
+    resp = {
+        "correct": True, "solved": False, "failed": False,
+        "opponent_move": reply,
+        "next_index": next_index if not done else None,
+    }
+    if done:
+        # The opponent's reply was the final move -> solved after it.
+        resp["solved"] = True
+        resp["puzzle_rating"] = _finish_puzzle(user, puzzle, solved=True)
+    return jsonify(resp)
+
+
 @app.get("/api/me")
 def api_me():
     user = _current_user()
@@ -243,19 +714,211 @@ def api_me():
     })
 
 
+# The rating series the dashboard renders, in a stable display order.
+DASHBOARD_KINDS = ("fide_blitz", "fide_rapid", "fide_classical", "rated",
+                   "puzzle")
+
+
+def _clean_date_bound(value, end_of_day=False):
+    """Normalize a from/to query param (YYYY-MM-DD) into a comparable string.
+
+    Returns None for a missing/blank value. For a `to` bound we append the
+    end-of-day time so the whole day is inclusive against second-precision
+    stored timestamps. Anything not shaped like a date is ignored (None)."""
+    if not value:
+        return None
+    s = str(value).strip()
+    if len(s) < 10:
+        return None
+    day = s[:10]
+    # Cheap shape check: YYYY-MM-DD.
+    if day[4] != "-" or day[7] != "-":
+        return None
+    if not (day[:4].isdigit() and day[5:7].isdigit() and day[8:10].isdigit()):
+        return None
+    return day + "T23:59:59" if end_of_day else day
+
+
+# GMT+8 (Asia/Singapore, UTC+8, no DST) as a fixed offset. The dashboard buckets
+# rating history into calendar days at 00:00 GMT+8 boundaries.
+GMT8 = datetime.timezone(datetime.timedelta(hours=8))
+
+
+def _parse_utc(at):
+    """Parse a rating_history `at` string into an aware UTC datetime.
+
+    Handles the shapes storage produces on both backends: ISO with a trailing
+    'Z' or '+00:00' offset, a space OR 'T' date/time separator, and
+    second-precision (with or without fractional seconds). A naive timestamp is
+    assumed to already be UTC. Returns None if it cannot be parsed."""
+    if at is None:
+        return None
+    s = str(at).strip()
+    if not s:
+        return None
+    s = s.replace(" ", "T", 1)
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        # Fall back to bare second precision without an offset.
+        try:
+            dt = datetime.datetime.strptime(s[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def _parse_gmt8_day(day):
+    """Parse a 'YYYY-MM-DD' string into a datetime.date, or None."""
+    if not day:
+        return None
+    try:
+        return datetime.date.fromisoformat(str(day)[:10])
+    except ValueError:
+        return None
+
+
+def daily_series_gmt8(points, start_date, end_date):
+    """Derive a per-day rating series at GMT+8 00:00 boundaries (read-only).
+
+    `points` is the raw rating_history for ONE series: an iterable of
+    {"at": <UTC ISO-ish string>, "rating": <number>}, ascending by time (order
+    is not relied upon; it is sorted defensively). `start_date` and `end_date`
+    are inclusive GMT+8 calendar-day bounds as 'YYYY-MM-DD' strings (or
+    datetime.date). Returns a list of {"date": 'YYYY-MM-DD', "rating": float}
+    with one entry per GMT+8 day in [start_date, end_date].
+
+    For each GMT+8 calendar day D the plotted value is the rating of the LATEST
+    event whose instant is AT OR BEFORE that day's 00:00 GMT+8 boundary. That
+    boundary instant is D 00:00:00 +08:00 == (D-1) 16:00:00 UTC. A day with no
+    new event carries forward the prior known value (last-known-value / step);
+    days before the series' first event have NO point (are skipped). This is a
+    pure function -- no Flask/DB -- so it is directly unit-testable."""
+    if isinstance(start_date, datetime.date):
+        start = start_date
+    else:
+        start = _parse_gmt8_day(start_date)
+    if isinstance(end_date, datetime.date):
+        end = end_date
+    else:
+        end = _parse_gmt8_day(end_date)
+    if start is None or end is None or end < start:
+        return []
+
+    # Normalize events to (utc_instant, rating), ascending.
+    events = []
+    for p in points or []:
+        inst = _parse_utc(p.get("at"))
+        if inst is None:
+            continue
+        try:
+            rating = round(float(p["rating"]), 2)
+        except (TypeError, ValueError, KeyError):
+            continue
+        events.append((inst, rating))
+    events.sort(key=lambda e: e[0])
+    if not events:
+        return []
+
+    out = []
+    idx = 0
+    n = len(events)
+    last_rating = None
+    have_value = False
+    day = start
+    one_day = datetime.timedelta(days=1)
+    while day <= end:
+        # 00:00 GMT+8 of `day` == (day-1) 16:00:00 UTC.
+        boundary = datetime.datetime(
+            day.year, day.month, day.day, tzinfo=GMT8
+        ).astimezone(datetime.timezone.utc)
+        # Advance through every event at or before this boundary instant.
+        while idx < n and events[idx][0] <= boundary:
+            last_rating = events[idx][1]
+            have_value = True
+            idx += 1
+        if have_value:
+            out.append({"date": day.isoformat(), "rating": last_rating})
+        day += one_day
+    return out
+
+
+@app.get("/api/dashboard")
+def api_dashboard():
+    """Return the logged-in player's DAILY rating series for the Dashboard.
+
+    Auth required (401 otherwise). Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD
+    bounds the selected period as GMT+8 calendar days (inclusive). Presets
+    (Past week/month/year) map to from/to client-side; 'All' omits `from` so
+    the lower bound becomes the GMT+8 day of the user's EARLIEST rating_history
+    event (upper bound defaults to today's GMT+8 day when `to` is absent).
+
+    The durable rating_history event log is UNCHANGED (event-driven; no
+    snapshot table). Each series is DERIVED READ-ONLY into per-day points at
+    GMT+8 00:00 boundaries via daily_series_gmt8: for every GMT+8 day in the
+    window the value is the most recent event at or before that day's midnight
+    (last-known-value/step), days with no new event carry forward the prior
+    value, and days before a series' first event have no point. Response:
+    series[kind] is a list of {date: 'YYYY-MM-DD', rating: <float>} (a shape
+    change from the earlier raw {at, rating} event points)."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+
+    from_arg = _clean_date_bound(request.args.get("from"))
+    to_arg = _clean_date_bound(request.args.get("to"))
+
+    # Today's GMT+8 calendar day is the default upper bound.
+    today_gmt8 = datetime.datetime.now(GMT8).date()
+    end_day = _parse_gmt8_day(to_arg) or today_gmt8
+
+    if from_arg:
+        start_day = _parse_gmt8_day(from_arg)
+    else:
+        # 'All': lower bound is the GMT+8 day of the earliest event (if any).
+        earliest = STORE.earliest_rating_history_at(user["id"])
+        earliest_dt = _parse_utc(earliest) if earliest else None
+        start_day = earliest_dt.astimezone(GMT8).date() if earliest_dt else None
+
+    series = {kind: [] for kind in DASHBOARD_KINDS}
+    if start_day is not None and end_day is not None and start_day <= end_day:
+        # Read the full event log once; derive each series read-only.
+        points = STORE.list_rating_history(user["id"])
+        by_kind = {kind: [] for kind in DASHBOARD_KINDS}
+        for p in points:
+            by_kind.setdefault(p["kind"], []).append(p)
+        for kind in DASHBOARD_KINDS:
+            series[kind] = daily_series_gmt8(
+                by_kind.get(kind, []), start_day, end_day)
+
+    return jsonify({
+        "from": start_day.isoformat() if start_day is not None else None,
+        "to": end_day.isoformat() if (
+            start_day is not None and end_day is not None) else None,
+        "kinds": list(DASHBOARD_KINDS),
+        "series": series,
+    })
+
+
 # ==========================================================================
 # Game API
 # ==========================================================================
 
 def _persist_in_progress(user_id, gid, human_color, moves_uci, started_at,
                          base_seconds=None, increment=0, clock=None,
-                         mode=None):
+                         mode=None, start_fen=None):
     """Create or update the single in-progress game row for a user.
 
     `clock` is the live {white, black} remaining seconds (or None for
     unlimited) so a resumed game continues with the correct times.
     `mode` (fide/rated/casual) is stored so the My Games Mode filter works for
-    ongoing games too. Returns the game id (existing or newly created).
+    ongoing games too. `start_fen` is the custom starting position (casual
+    only; None for a standard game) so a resumed custom game replays correctly.
+    Returns the game id (existing or newly created).
     """
     cw = clock.get("white") if isinstance(clock, dict) else None
     cb = clock.get("black") if isinstance(clock, dict) else None
@@ -263,7 +926,7 @@ def _persist_in_progress(user_id, gid, human_color, moves_uci, started_at,
         user_id=user_id, game_id=gid, human_color=human_color,
         moves_uci=moves_uci, started_at=started_at,
         base_seconds=base_seconds, increment=increment,
-        clock_white=cw, clock_black=cb, mode=mode)
+        clock_white=cw, clock_black=cb, mode=mode, start_fen=start_fen)
 
 
 @app.post("/api/new")
@@ -287,6 +950,21 @@ def api_new():
     if mode in ("fide", "rated") and not user:
         mode = "casual"
 
+    # Custom starting position (Casual mode ONLY): a pasted FEN or a
+    # board-editor-produced FEN. Honored only in casual; ignored otherwise so
+    # rated/FIDE games always start from the standard position.
+    start_fen = data.get("fen")
+    if start_fen is not None and not str(start_fen).strip():
+        start_fen = None
+    if start_fen is not None and mode != "casual":
+        start_fen = None
+    if start_fen is not None:
+        # Validate the FEN up front so an invalid one is a clear 400.
+        try:
+            core.board_from_start_fen(start_fen)
+        except core.InvalidStartFen as exc:
+            return jsonify({"error": str(exc)}), 400
+
     # Parse + validate the time control (custom or unlimited).
     try:
         base_seconds, increment = _parse_time_control(data)
@@ -303,12 +981,16 @@ def api_new():
                 "in_progress_game_id": existing["id"],
             }), 409
 
-    board, san_history, moves_uci = core.rebuild_board([])
+    board, san_history, moves_uci = core.rebuild_board([], start_fen=start_fen)
     started_at = _now_iso()
     last_bot_move = None
+    # Chess Amateur moves first when it is on move at the start: the human is
+    # Black in a standard game, OR (custom position) the side to move is not
+    # the human's color. Mode-aware reply so FIDE uses the book-then-fallback.
+    bot_to_move_at_start = (core.turn_str(board) != human_color)
     try:
-        if human_color == "black" and not board.is_game_over(claim_draw=True):
-            uci, san = core.engine_move(board, threads=threads)
+        if bot_to_move_at_start and not board.is_game_over(claim_draw=True):
+            uci, san = core.reply_move(board, mode=mode, threads=threads)
             if uci:
                 san_history.append(san)
                 moves_uci.append(uci)
@@ -328,7 +1010,7 @@ def api_new():
         gid = _persist_in_progress(user["id"], None, human_color,
                                    moves_uci, started_at,
                                    base_seconds=base_seconds, increment=increment,
-                                   clock=clock, mode=mode)
+                                   clock=clock, mode=mode, start_fen=start_fen)
 
     player_rating, bot_rating = R.display_ratings(
         user, mode, base_seconds, increment)
@@ -343,7 +1025,8 @@ def api_new():
     }
     return jsonify(core.state_dict(board, human_color, threads, san_history,
                                    moves_uci, game_id=gid,
-                                   last_bot_move=last_bot_move, extra=extra))
+                                   last_bot_move=last_bot_move, extra=extra,
+                                   start_fen=start_fen))
 
 
 @app.post("/api/move")
@@ -373,11 +1056,10 @@ def api_move():
         base_seconds = None
     unlimited = base_seconds is None
 
-    # Rebuild authoritative position from carried history.
-    try:
-        board, san_history, moves_uci = core.rebuild_board(data.get("moves"))
-    except core.InvalidMoveHistory:
-        return jsonify({"error": "invalid move history"}), 400
+    # Custom starting position (Casual only), carried statelessly by the client.
+    start_fen = data.get("fen") or data.get("start_fen")
+    if start_fen is not None and not str(start_fen).strip():
+        start_fen = None
 
     # For logged-in users, bind this to their in-progress game (if any) so we
     # update the right row, and take the authoritative time control from the DB.
@@ -395,6 +1077,22 @@ def api_move():
             # request's parsed mode for rows written before mode was stored).
             if ip.get("mode"):
                 mode = _parse_mode(ip["mode"])
+            # Authoritative custom start FEN from the persisted game.
+            if ip.get("start_fen"):
+                start_fen = ip["start_fen"]
+
+    # A custom start FEN is only meaningful in casual mode.
+    if mode != "casual":
+        start_fen = None
+
+    # Rebuild authoritative position from carried history (on the custom start).
+    try:
+        board, san_history, moves_uci = core.rebuild_board(
+            data.get("moves"), start_fen=start_fen)
+    except core.InvalidStartFen:
+        return jsonify({"error": "invalid FEN"}), 400
+    except core.InvalidMoveHistory:
+        return jsonify({"error": "invalid move history"}), 400
 
     if board.is_game_over(claim_draw=True):
         return jsonify({"error": "game is over"}), 400
@@ -428,14 +1126,17 @@ def api_move():
                     moves_uci=moves_uci, started_at=started_at,
                     ended_at=_now_iso(), base_seconds=base_seconds,
                     increment=increment, rating_delta=rating_delta,
-                    eco_code=eco_code, eco_name=eco_name, mode=mode)
+                    eco_code=eco_code, eco_name=eco_name, mode=mode,
+                    player_rating_after=_player_rating_after(
+                        user, mode, base_seconds, increment))
             extra = _move_extra(user, mode, base_seconds, increment, started_at,
                                 clock, in_progress=False, game_over=True,
                                 rating_delta=rating_delta,
                                 result=result, result_reason="time forfeit")
             return jsonify(core.state_dict(
                 board, human_color, threads, san_history, moves_uci,
-                game_id=gid, last_bot_move=None, extra=extra))
+                game_id=gid, last_bot_move=None, extra=extra,
+                start_fen=start_fen))
         # Normal deduction + increment for the human's move.
         clock[human_color] = human_remaining - elapsed + increment
 
@@ -478,16 +1179,22 @@ def api_move():
                         moves_uci=moves_uci, started_at=started_at,
                         ended_at=_now_iso(), base_seconds=base_seconds,
                         increment=increment, rating_delta=rating_delta,
-                        eco_code=eco_code, eco_name=eco_name, mode=mode)
+                        eco_code=eco_code, eco_name=eco_name, mode=mode,
+                        player_rating_after=_player_rating_after(
+                            user, mode, base_seconds, increment))
                 extra = _move_extra(user, mode, base_seconds, increment,
                                     started_at, clock, in_progress=False,
                                     game_over=True, rating_delta=rating_delta,
                                     result=result, result_reason="time forfeit")
                 return jsonify(core.state_dict(
                     board, human_color, threads, san_history, moves_uci,
-                    game_id=gid, last_bot_move=None, extra=extra))
+                    game_id=gid, last_bot_move=None, extra=extra,
+                    start_fen=start_fen))
         try:
-            uci, san = core.engine_move(board, threads=threads)
+            # FIDE-rated mode uses the Polyglot book (pc2500.bin) when the
+            # position is in it, else falls through to Stockfish depth 1.
+            # Rated/Casual never consult the book.
+            uci, san = core.reply_move(board, mode=mode, threads=threads)
         except core.EngineUnavailable:
             return jsonify({"error": "engine unavailable"}), 500
         if uci:
@@ -514,13 +1221,15 @@ def api_move():
                 moves_uci=moves_uci, started_at=started_at,
                 ended_at=_now_iso(), base_seconds=base_seconds,
                 increment=increment, rating_delta=rating_delta,
-                eco_code=eco_code, eco_name=eco_name, mode=mode)
+                eco_code=eco_code, eco_name=eco_name, mode=mode,
+                player_rating_after=_player_rating_after(
+                    user, mode, base_seconds, increment))
         else:
             gid = _persist_in_progress(user["id"], gid, human_color,
                                        moves_uci, started_at,
                                        base_seconds=base_seconds,
                                        increment=increment, clock=clock,
-                                       mode=mode)
+                                       mode=mode, start_fen=start_fen)
 
     extra = _move_extra(user, mode, base_seconds, increment, started_at, clock,
                         in_progress=bool(user) and not game_over,
@@ -531,7 +1240,8 @@ def api_move():
     extra["bot_think"] = bot_think if (mode == "fide" and not unlimited) else 0.0
     return jsonify(core.state_dict(board, human_color, threads, san_history,
                                    moves_uci, game_id=gid,
-                                   last_bot_move=last_bot_move, extra=extra))
+                                   last_bot_move=last_bot_move, extra=extra,
+                                   start_fen=start_fen))
 
 
 def _move_extra(user, mode, base_seconds, increment, started_at, clock,
@@ -594,7 +1304,9 @@ def api_resign():
         moves_uci=ip["moves"], started_at=ip["started_at"],
         ended_at=_now_iso(), base_seconds=ip["base_seconds"],
         increment=ip["increment"], rating_delta=rating_delta,
-        eco_code=eco_code, eco_name=eco_name, mode=mode)
+        eco_code=eco_code, eco_name=eco_name, mode=mode,
+        player_rating_after=_player_rating_after(
+            user, mode, ip["base_seconds"], ip["increment"]))
     # _apply_result_and_rating refreshed `user` in place, so display_ratings
     # now reports the POST-update player rating (with the delta shown alongside).
     player_rating, bot_rating = R.display_ratings(
@@ -619,8 +1331,14 @@ def api_view():
     human_color = str(data.get("human_color", "white")).lower()
     if human_color not in ("white", "black"):
         human_color = "white"
+    start_fen = data.get("fen") or data.get("start_fen")
+    if start_fen is not None and not str(start_fen).strip():
+        start_fen = None
     try:
-        board, san_history, moves_uci = core.rebuild_board(data.get("moves"))
+        board, san_history, moves_uci = core.rebuild_board(
+            data.get("moves"), start_fen=start_fen)
+    except core.InvalidStartFen:
+        return jsonify({"error": "invalid FEN"}), 400
     except core.InvalidMoveHistory:
         return jsonify({"error": "invalid move history"}), 400
     threads = core.coerce_threads(data.get("threads"))
@@ -629,7 +1347,8 @@ def api_view():
                                    moves_uci, game_id=data.get("game_id"),
                                    last_bot_move=None,
                                    extra={"eco_code": eco_code,
-                                          "eco_name": eco_name}))
+                                          "eco_name": eco_name},
+                                   start_fen=start_fen))
 
 
 @app.get("/api/in-progress")
@@ -654,6 +1373,7 @@ def api_in_progress():
         "time_class": R.time_class(ip["base_seconds"], ip["increment"]),
         "clock": ip.get("clock"),
         "mode": ip.get("mode"),
+        "start_fen": ip.get("start_fen"),
         "player_rating": player_rating, "bot_rating": bot_rating,
     }})
 

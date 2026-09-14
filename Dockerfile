@@ -48,8 +48,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Application code. The Flask app (app.py) is the entry point; it reuses the
 # engine (engine.py) and the stateless chess core (chess_core.py), and adds
 # accounts/history (auth.py, storage.py). Templates + static assets included.
-COPY engine.py chess_core.py auth.py storage.py ratings.py timecontrol.py clockclient.py eco.py app.py ./
+COPY engine.py chess_core.py auth.py storage.py ratings.py timecontrol.py clockclient.py eco.py fide.py book.py syzygy.py puzzles.py app.py ./
 COPY eco.json ./
+# Polyglot opening book (used ONLY in FIDE-rated mode; probed in the app layer
+# because Stockfish has no built-in Polyglot support). MUST be shipped.
+COPY pc2500.bin ./
 COPY static/ ./static/
 COPY templates/ ./templates/
 
@@ -62,7 +65,38 @@ COPY templates/ ./templates/
 #                  GUEST-ONLY mode (play works; accounts/history disabled).
 #   SECRET_KEY   : Flask session signing key (set this in production so logins
 #                  persist across restarts).
+#   SUPABASE_URL         : Supabase project URL. When set together with
+#                          SUPABASE_ANON_KEY, identity + login/signup +
+#                          password-reset emails are handled by Supabase Auth.
+#                          If UNSET, the app falls back to the built-in
+#                          bcrypt-local auth (and guest play) exactly as before.
+#   SUPABASE_ANON_KEY    : Supabase anon/public API key (client-side auth calls:
+#                          sign_up / sign_in / password-reset email).
+#   SUPABASE_SERVICE_KEY : Supabase service-role key (server-side admin calls;
+#                          required only for deleting the Supabase auth user on
+#                          account deletion). Optional; account deletion still
+#                          removes the local row without it.
+#   -- Tablebases (Syzygy, 5-men WDL) ------------------------------------------
+#   SYZYGY_DIR    : Directory the 5-men WDL (.rtbw) tablebase files are
+#                   downloaded into AT CONTAINER STARTUP and that Stockfish's
+#                   SyzygyPath UCI option points at. Default /tmp/syzygy (an
+#                   EPHEMERAL path -- NOT baked into the image, NOT a paid
+#                   persistent disk). Set to "" to DISABLE tablebases.
+#   SYZYGY_URL    : Base URL to download the individual .rtbw files from.
+#                   Default https://tablebase.lichess.ovh/tables/standard/3-4-5/
+#                   (the public Lichess Syzygy mirror). WDL-only (~386 MB): at
+#                   depth 1 the WDL tables are what change the root move; the
+#                   DTZ tables are not needed.
+#   SYZYGY_DISABLE: "1" to skip the startup download AND leave SyzygyPath unset
+#                   (used for local dev / the offline test suite so no ~386 MB
+#                   download is attempted). The download is guarded by a marker
+#                   file (.syzygy_complete) so a restart reuses an existing
+#                   download and the single gunicorn worker never re-downloads.
+#   -- Opening book ------------------------------------------------------------
+#   POLYGLOT_BOOK : Path to the Polyglot book (default: pc2500.bin next to the
+#                   app). Consulted ONLY in FIDE-rated mode.
 ENV STOCKFISH_PATH=/usr/local/bin/stockfish \
+    SYZYGY_DIR=/tmp/syzygy \
     PORT=8000 \
     SF_THREADS=128 \
     PYTHONUNBUFFERED=1
@@ -74,4 +108,10 @@ EXPOSE 8000
 # memory model (the whole app shares one engine instance); --threads lets that
 # one worker handle concurrent HTTP requests. The engine's own lock serializes
 # actual searches. `sh -c` so ${PORT} is expanded at runtime (Render injects it).
-CMD ["sh", "-c", "gunicorn --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:${PORT} app:app"]
+#
+# BEFORE gunicorn boots we run `python -m syzygy`, which downloads the 5-men WDL
+# Syzygy set into $SYZYGY_DIR (ephemeral, marker-guarded so a restart reuses it;
+# a no-op when SYZYGY_DISABLE=1 or SYZYGY_DIR is empty). The download runs to
+# completion first so /healthz is only served once the engine can probe the
+# tablebases; it is NOT baked into the image and uses no persistent disk.
+CMD ["sh", "-c", "python -m syzygy; gunicorn --workers 1 --threads 8 --timeout 120 --bind 0.0.0.0:${PORT} app:app"]

@@ -31,6 +31,32 @@ import sys
 import threading
 import time
 
+try:
+    import syzygy as _syzygy
+except Exception:  # pragma: no cover - syzygy module must import, but be safe
+    _syzygy = None
+
+
+def syzygy_setoption_commands(dir_getter=None):
+    """Return the list of UCI setoption commands for Syzygy tablebases.
+
+    Sent AFTER 'uci'/'uciok' and BEFORE 'isready'/'readyok'. Emits a single
+    'setoption name SyzygyPath value <dir>' when a non-empty, existing Syzygy
+    directory is configured; otherwise returns an empty list (no SyzygyPath).
+
+    `dir_getter` is injectable for tests; defaults to syzygy.syzygy_dir which
+    returns the configured dir only when it exists and holds .rtbw files.
+    """
+    if dir_getter is None:
+        dir_getter = _syzygy.syzygy_dir if _syzygy is not None else (lambda: None)
+    try:
+        directory = dir_getter()
+    except Exception:
+        directory = None
+    if not directory:
+        return []
+    return ["setoption name SyzygyPath value %s" % directory]
+
 DEFAULT_STOCKFISH_PATH = "/projects/sandbox/stockfish/stockfish-linux-x86-64-universal"
 DEFAULT_DEPTH = 1
 DEFAULT_THREADS = 128
@@ -126,6 +152,11 @@ class ChessAmateurEngine:
         self._send(proc, "uci")
         self._read_until(proc, "uciok", timeout=HANDSHAKE_TIMEOUT)
         self._send(proc, "setoption name Threads value %d" % self.threads)
+        # Tablebases: after 'uciok' and BEFORE 'isready'/'readyok', point
+        # Stockfish at the Syzygy directory when one is configured + populated.
+        # WDL-only 5-men set; disabled/absent -> no command emitted.
+        for cmd in syzygy_setoption_commands():
+            self._send(proc, cmd)
         self._send(proc, "isready")
         self._read_until(proc, "readyok", timeout=HANDSHAKE_TIMEOUT)
         self._applied_threads = self.threads

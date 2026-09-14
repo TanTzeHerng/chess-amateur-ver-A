@@ -66,6 +66,16 @@ a:hover { color: var(--white); }
   border: 1px solid var(--blue); background: var(--black);
   padding: .4rem .5rem; margin-top: .2rem; min-width: 10rem;
 }
+/* Topbar Settings/Profile dropdowns overlay the page instead of growing the
+   top strip: absolutely position their bodies over the position:relative
+   .disclosure parent, on top of everything, with a solid black background +
+   palette border. This keeps the topbar height fixed when they open. The
+   [hidden] attribute still controls show/hide (see [hidden] rule above). */
+#settingsBody, #profileBody {
+  position: absolute; top: 100%; right: 0; z-index: 80;
+  background: var(--black); border: 1px solid var(--blue);
+}
+#profileBody { min-width: 12rem; }
 .disclosure-body .toggle-row { display: flex; align-items: center; justify-content: space-between; margin: .3rem 0; }
 .disclosure-body label { color: var(--white); }
 .disclosure-body input[type="checkbox"] { width: 1.1rem; height: 1.1rem; accent-color: var(--magenta); }
@@ -166,11 +176,92 @@ a:hover { color: var(--white); }
 }
 .net-box { border: 2px solid var(--red); background: var(--black); padding: 1rem; text-align: center; color: var(--red); max-width: 20rem; }
 .net-box p { margin: 0 0 .6rem; }
+
+/* ---- delete-account confirmation overlay (explicit intent) ---- */
+.confirm-overlay[hidden] { display: none !important; }
+.confirm-overlay {
+  position: fixed; inset: 0; background: var(--black);
+  display: flex; align-items: center; justify-content: center; z-index: 90;
+}
+.confirm-box { border: 2px solid var(--red); background: var(--black); padding: 1rem; text-align: center; color: var(--red); max-width: 22rem; }
+.confirm-box p { margin: 0 0 .8rem; }
+.confirm-actions { display: flex; gap: .6rem; justify-content: center; }
+
+/* ---- dashboard overlay (FEAT-010 rating line graphs) ----
+   Strict 8-color palette: every channel is 0 or 255 (via the palette vars);
+   no rgba/opacity/gradients. One pure color per series (set inline in JS from
+   the same palette hexes); axes/gridlines/labels in blue. */
+.dashboard-overlay[hidden] { display: none !important; }
+.dashboard-overlay {
+  position: fixed; inset: 0; background: var(--black);
+  display: flex; align-items: center; justify-content: center; z-index: 95;
+  overflow: auto;
+}
+.dashboard-box {
+  border: 2px solid var(--cyan); background: var(--black); padding: 1rem;
+  color: var(--white); max-width: 40rem; width: 92%; max-height: 92%;
+  overflow: auto;
+}
+.dashboard-head { display: flex; align-items: center; justify-content: space-between; }
+.dashboard-head h2 { margin: 0; }
+.dashboard-range {
+  display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+  margin: .6rem 0;
+}
+.dashboard-range input[type="date"],
+.dashboard-range select {
+  background: var(--black); color: var(--white); border: 1px solid var(--green);
+}
+/* The Custom-period date inputs live in this container, revealed only when the
+   period selector is on 'Custom' (toggled via the [hidden] attribute; the
+   global [hidden]{display:none!important} hides it otherwise). */
+#dashboardCustomRange {
+  display: inline-flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+}
+.dashboard-charts { display: flex; flex-direction: column; gap: 1rem; }
+.dash-card { border: 1px solid var(--blue); padding: .5rem; }
+.dash-card-head { display: flex; align-items: center; gap: .4rem; margin-bottom: .3rem; }
+.dash-swatch { display: inline-block; width: .8rem; height: .8rem; border: 1px solid var(--white); }
+.dash-card-title { color: var(--white); font-size: .85rem; }
+.dash-chart { display: block; width: 100%; height: auto; background: var(--black); }
+.dash-label { font-size: 10px; }
+
+/* ---- onboarding demo overlay (FEAT-009) ----
+   Brief, skippable feature walkthrough. Strict 8-color palette (every channel
+   0 or 255 via the palette vars); no rgba/opacity/gradients; [hidden] hides. */
+.demo-overlay[hidden] { display: none !important; }
+.demo-overlay {
+  position: fixed; inset: 0; background: var(--black);
+  display: flex; align-items: center; justify-content: center; z-index: 100;
+  overflow: auto;
+}
+.demo-box {
+  border: 2px solid var(--cyan); background: var(--black); padding: 1rem;
+  color: var(--white); max-width: 32rem; width: 92%; max-height: 92%;
+  overflow: auto;
+}
+.demo-head { display: flex; align-items: center; justify-content: space-between; }
+.demo-head h2 { margin: 0; }
+.demo-slide { min-height: 6rem; }
+.demo-slide h3 { color: var(--yellow); margin: .8rem 0 .4rem; }
+.demo-slide p { margin: 0; color: var(--white); }
+.demo-slide b { color: var(--green); }
+.demo-foot {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-top: 1rem;
+}
+.demo-progress { color: var(--cyan); font-size: .85rem; }
+.demo-actions { display: flex; gap: .6rem; }
+.navlink.danger { color: var(--red); }
+.navlink.danger:hover { border-bottom-color: var(--red); }
 legend, h2 { color: var(--cyan); }
 fieldset { border: 1px solid var(--green); }
 label { color: var(--white); }
 
 .hint { color: var(--green); font-size: .8rem; margin: .3rem 0 0; }
+
+/* Muted "(optional)" note next to a form label (e.g. the FIDE ID field). */
+.optional { color: var(--green); font-weight: normal; font-size: .8rem; }
 
 input[type="number"] {
   background: var(--black); color: var(--yellow);
@@ -278,6 +369,18 @@ input[type="number"] {
 }
 .filter-sub { border-top: 1px solid var(--blue); margin-top: .3rem; padding-top: .3rem; }
 .filter-sub .sub-label { color: var(--yellow); font-size: .75rem; display: block; margin-bottom: .2rem; }
+.custom-tc label { display: inline-block; margin-right: .4rem; color: var(--white); }
+.custom-tc input[type="number"] { width: 3.2rem; }
+
+/* ---- My Games result cell: colored token + post-game rating/delta ----
+   Win = green, loss = red, draw = white (relative to the human). Overrides the
+   generic .history-table .mono green. Strict 8-color palette (channels 0/255,
+   no rgba/opacity). */
+.result-token.result-win { color: var(--green); }
+.result-token.result-loss { color: var(--red); }
+.result-token.result-draw { color: var(--white); }
+.result-rating { color: var(--white); font-weight: bold; }
+.result-delta { color: var(--cyan); }
 
 /* ---- mode / time-control controls (8-color palette) ---- */
 .mode-choice, .tc-choice { border: 1px solid var(--green); margin-top: .5rem; }
@@ -289,4 +392,130 @@ input[type="number"] {
 .tc-inputs.disabled { opacity: 1; }          /* no opacity blends; hide instead */
 .tc-inputs[hidden] { display: none !important; }
 
+/* ---- custom position (Casual only) + board editor (8-color palette) ---- */
+.custom-choice { border: 1px solid var(--magenta); margin-top: .5rem; }
+.custom-choice legend { color: var(--magenta); }
+.custom-choice label { color: var(--white); }
+.custom-body { margin-top: .4rem; }
+.custom-fen-row { display: flex; align-items: center; gap: .4rem; margin-bottom: .4rem; }
+.custom-fen-row label { color: var(--white); }
+.custom-fen-row input[type="text"] {
+  flex: 1; background: var(--black); color: var(--green);
+  border: 1px solid var(--cyan); font: inherit; min-width: 0;
+}
+#customFenError, #editorError { color: var(--red); margin: .3rem 0 0; }
 
+/* Board-editor overlay: full-screen, solid black, palette border. Show/hide
+   via [hidden] (see the global [hidden] rule). */
+.editor-overlay {
+  position: fixed; inset: 0; z-index: 90;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--black);
+}
+.editor-box {
+  border: 2px solid var(--cyan); background: var(--black);
+  padding: 1rem; max-width: 900px; width: 95%;
+  max-height: 95vh; overflow: auto;
+}
+.editor-box h2 { color: var(--magenta); margin-top: 0; }
+.editor-layout { display: flex; flex-wrap: wrap; gap: 1rem; align-items: flex-start; }
+.editor-board {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  aspect-ratio: 1 / 1; width: 360px; max-width: 90vw;
+  border: 2px solid var(--cyan);
+}
+.editor-sq {
+  position: relative;
+  display: flex; align-items: center; justify-content: center;
+  user-select: none; cursor: pointer;
+}
+.editor-sq.light { background: var(--cyan); }
+.editor-sq.dark  { background: var(--blue); }
+.editor-side { flex: 1; min-width: 220px; color: var(--white); }
+.editor-palette { display: flex; flex-wrap: wrap; gap: .3rem; margin-bottom: .4rem; }
+.editor-palette-btn {
+  background: var(--black); border: 1px solid var(--cyan); color: var(--white);
+  font: inherit; cursor: pointer; padding: .2rem .4rem; min-width: 2.2rem;
+}
+.editor-palette-btn.selected { border-color: var(--yellow); background: var(--blue); }
+.editor-turn, .editor-castling { border: 1px solid var(--green); margin: .4rem 0; }
+.editor-turn legend, .editor-castling legend { color: var(--green); }
+.editor-castling label { display: block; }
+.editor-fields { margin: .4rem 0; }
+.editor-fields label { display: block; margin-top: .3rem; color: var(--white); }
+.editor-fields input[type="text"], .editor-fields input[type="number"] {
+  background: var(--black); color: var(--green); border: 1px solid var(--cyan); font: inherit;
+}
+.editor-actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .5rem; }
+
+
+/* ---- Collections tree (My Games folders, FEAT-006). 8-color palette only;
+   show/hide of subtrees via the [hidden] attribute. ---- */
+.collections-panel {
+  border: 1px solid var(--magenta); margin-bottom: 1rem; padding: .4rem .6rem;
+}
+.collections-head {
+  display: flex; align-items: center; justify-content: space-between; gap: .5rem;
+}
+.collections-head h2 { margin: 0; font-size: 1rem; color: var(--magenta); }
+.collections-tree { list-style: none; margin: .3rem 0 0; padding-left: 0; }
+.collections-tree .collections-tree { padding-left: 1.1rem; border-left: 1px solid var(--blue); }
+.coll-node { margin: .1rem 0; }
+.coll-row {
+  display: flex; align-items: center; gap: .3rem;
+  padding: .1rem .2rem; border: 1px solid var(--black);
+}
+.coll-row.coll-selected { border-color: var(--yellow); }
+.coll-toggle {
+  background: none; border: none; color: var(--cyan); font: inherit;
+  cursor: pointer; width: 1.2rem; text-align: center; padding: 0;
+}
+.coll-name { color: var(--green); flex: 1; text-align: left; }
+.coll-name:hover { color: var(--white); }
+.coll-actions { display: inline-flex; gap: .35rem; }
+.coll-act { color: var(--yellow); }
+.coll-act:hover { color: var(--white); }
+
+/* Per-row assign-to-collection dropdown in the action cell. */
+.assign-select {
+  background: var(--black); color: var(--green); border: 1px solid var(--cyan);
+  font: inherit; font-size: .78rem; padding: .1rem .2rem;
+}
+
+/* ---- Hover mini-board (quick replay near the cursor, FEAT-006). Fixed
+   position, follows the cursor via inline left/top; shown/hidden by [hidden].
+   Strict palette: cyan/blue checker, white/yellow glyphs, cyan border. No
+   opacity/rgba. ---- */
+.mini-board {
+  position: fixed; z-index: 200;
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  width: 160px; height: 160px;
+  border: 2px solid var(--cyan); background: var(--black);
+  pointer-events: none;   /* never intercept the cursor during replay */
+}
+.mini-sq {
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px; line-height: 1;
+}
+.mini-light { background: var(--cyan); }
+.mini-dark  { background: var(--blue); }
+.mini-wp { color: var(--white); }
+.mini-bp { color: var(--yellow); }
+
+/* ---- Train view (FEAT-008) ---- */
+/* The Train tab button reuses .navlink/.btnlink styling. Its pressed state
+   uses the yellow accent (a palette color) so the active tab is obvious. */
+#trainTab[aria-pressed="true"] { color: var(--yellow); }
+
+.train-turn {
+  margin: .3rem 0;
+  color: var(--yellow);
+  font-weight: bold;
+}
+.train-panel h2 { color: var(--cyan); margin-top: 0; }
+.train-status { color: var(--white); }
+.train-panel .hint { color: var(--green); }

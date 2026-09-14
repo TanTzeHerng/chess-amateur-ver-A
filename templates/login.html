@@ -28,9 +28,18 @@
       <input id="password" name="password" type="password"
              autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" required />
 
+      {% if mode == 'register' %}
+      <label for="fideId">FIDE ID <span class="optional">(optional)</span></label>
+      <input id="fideId" name="fide_id" type="text" inputmode="numeric"
+             autocomplete="off" autocapitalize="none" spellcheck="false"
+             pattern="[0-9]*" />
+      {% endif %}
+
       <p class="hint" id="authHint">
         {% if mode == 'register' %}
           Username: 3&ndash;32 letters, digits, or underscores. Password: at least 8 characters.
+          Supply your FIDE ID to seed your starting FIDE ratings (any control you
+          are unrated in starts at 1400).
         {% else %}
           Enter your username and password.
         {% endif %}

@@ -29,7 +29,13 @@ if (authForm) {
     if (submit) submit.disabled = true;
     try {
       const url = mode === "register" ? "/api/register" : "/api/login";
-      const { ok, data } = await postJSON(url, { username, password });
+      const body = { username, password };
+      if (mode === "register") {
+        // Optional FIDE ID: seeds the player's starting FIDE ratings server-side.
+        const fideId = (document.getElementById("fideId") || {}).value || "";
+        if (fideId.trim()) body.fide_id = fideId.trim();
+      }
+      const { ok, data } = await postJSON(url, body);
       if (ok) {
         // Signed in: go to the board.
         window.location.href = "/";

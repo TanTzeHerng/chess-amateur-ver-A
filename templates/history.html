@@ -20,6 +20,21 @@
       <p class="empty">No games yet. <a href="{{ url_for('index') }}">Play one!</a></p>
     {% else %}
 
+    <!-- COLLECTIONS tree. Per-user nestable folders (built client-side from
+         window.HISTORY_COLLECTIONS by history.js). Create/rename/delete
+         folders + subfolders, and filter the games list by the selected
+         folder. Expand/collapse and the create-form use the [hidden]
+         attribute; all colors stay in the 8-color palette. -->
+    <section class="collections-panel" id="collectionsPanel">
+      <div class="collections-head">
+        <h2>Collections</h2>
+        <button type="button" class="btn btn-small" id="collNewRoot">New folder</button>
+      </div>
+      <ul class="collections-tree" id="collectionsTree">
+        <!-- Rendered client-side by history.js. The 'All games' root is first. -->
+      </ul>
+    </section>
+
     <!-- Sort + filter controls. All driven client-side by history.js over the
          embedded games JSON (below). Filter panels default hidden via the
          [hidden] attribute (the global rule governs show/hide). -->
@@ -28,8 +43,8 @@
         <label for="sortSelect">Sort</label>
         <select id="sortSelect">
           <option value="default" selected>Default</option>
-          <option value="start">Start Time</option>
-          <option value="end">End Time</option>
+          <option value="date_asc">Date (ascending)</option>
+          <option value="date_desc">Date (descending)</option>
         </select>
       </div>
 
@@ -50,7 +65,7 @@
               <span class="sub-label">Reason</span>
               <label><input type="checkbox" class="f-reason" value="checkmate" /> checkmate</label>
               <label><input type="checkbox" class="f-reason" value="resignation" /> resignation</label>
-              <label><input type="checkbox" class="f-reason" value="on time" /> on time</label>
+              <label><input type="checkbox" class="f-reason" value="timeout" /> timeout</label>
               <label><input type="checkbox" class="f-reason" value="3-fold repetition" /> 3-fold repetition</label>
               <label><input type="checkbox" class="f-reason" value="stalemate" /> stalemate</label>
               <label><input type="checkbox" class="f-reason" value="insufficient material" /> insufficient material</label>
@@ -66,14 +81,29 @@
           </fieldset>
 
           <!-- TIME CONTROL: exactly blitz/rapid/classical/unlimited/custom.
-               NO bullet. 'custom' = any explicitly time-limited control. -->
+               NO bullet. 'custom' does NOT mean 'any time-limited game'; it
+               lets the player match a SPECIFIC base time + increment (revealed
+               below when 'custom' is checked). Unlimited games never match
+               'custom'. -->
           <fieldset class="filter-group">
             <legend>Time control</legend>
             <label><input type="checkbox" class="f-tc" value="blitz" /> blitz</label>
             <label><input type="checkbox" class="f-tc" value="rapid" /> rapid</label>
             <label><input type="checkbox" class="f-tc" value="classical" /> classical</label>
             <label><input type="checkbox" class="f-tc" value="unlimited" /> unlimited</label>
-            <label><input type="checkbox" class="f-tc" value="custom" /> custom</label>
+            <label><input type="checkbox" class="f-tc" value="custom" id="fTcCustom" /> custom</label>
+            <!-- Custom base+increment inputs. Hidden until 'custom' is checked
+                 (show/hide via the [hidden] attribute). Base is h/m/s; the
+                 increment is in seconds. A game matches only when its
+                 base_seconds and increment equal these values exactly. -->
+            <div class="filter-sub custom-tc" id="customTcInputs" hidden>
+              <span class="sub-label">Base</span>
+              <label>h <input type="number" id="fCustomH" min="0" step="1" value="0" size="3" /></label>
+              <label>m <input type="number" id="fCustomM" min="0" step="1" value="0" size="3" /></label>
+              <label>s <input type="number" id="fCustomS" min="0" step="1" value="0" size="3" /></label>
+              <span class="sub-label">Increment</span>
+              <label>s <input type="number" id="fCustomInc" min="0" step="1" value="0" size="3" /></label>
+            </div>
           </fieldset>
 
           <!-- COLOR (the human's color). -->
@@ -123,6 +153,7 @@
        status, date. -->
   <script>
     window.HISTORY_GAMES = {{ games | tojson }};
+    window.HISTORY_COLLECTIONS = {{ collections | tojson }};
     window.HISTORY_INDEX_URL = {{ url_for('index') | tojson }};
   </script>
   <script src="{{ url_for('static', filename='auth.js') }}"></script>
