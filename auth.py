@@ -21,6 +21,7 @@ import bcrypt
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 USERNAME_MIN, USERNAME_MAX = 3, 32
+EMAIL_MAX = 254  # RFC 5321 practical maximum for an email address.
 PASSWORD_MIN, PASSWORD_MAX = 8, 200  # 200 keeps us well under bcrypt's 72-byte
                                      # limit note below; see _bcrypt_safe.
 
@@ -47,6 +48,35 @@ def validate_password(password):
         return "Password must be at least %d characters." % PASSWORD_MIN
     if len(password) > PASSWORD_MAX:
         return "Password must be at most %d characters." % PASSWORD_MAX
+    return None
+
+
+def validate_email(email):
+    """Return None if valid, else an error string.
+
+    Signup collects a REAL email so Supabase confirmation / password-reset
+    emails actually reach the user, so email is required. We keep the check
+    deliberately simple and sane (not a full RFC parser): a non-empty address
+    with exactly one '@', a non-empty local part, and a domain that contains a
+    dot with non-empty labels on either side of it.
+    """
+    if not isinstance(email, str):
+        return "Email is required."
+    email = email.strip()
+    if not email:
+        return "Email is required."
+    if len(email) > EMAIL_MAX:
+        return "Email must be at most %d characters." % EMAIL_MAX
+    if email.count("@") != 1:
+        return "Enter a valid email address."
+    local, _, domain = email.partition("@")
+    if not local or not domain:
+        return "Enter a valid email address."
+    if "." not in domain:
+        return "Enter a valid email address."
+    # No empty domain labels (rejects 'a@.com', 'a@b.', 'a@b..c').
+    if any(not label for label in domain.split(".")):
+        return "Enter a valid email address."
     return None
 
 
@@ -136,8 +166,12 @@ def _register_supabase(store, username, password, email):
     client = _supabase_client()
     if client is None:  # pragma: no cover - only when misconfigured at runtime
         return None, "Accounts are unavailable right now."
+    # Prefer the REAL email the user supplied so Supabase confirmation /
+    # reset emails reach them; fall back to the synthesized placeholder only
+    # if it is somehow absent (register_user requires it for real signups).
+    reg_email = _derive_email(username, email)
     try:
-        res = client.auth.sign_up({"email": _derive_email(username, email),
+        res = client.auth.sign_up({"email": reg_email,
                                    "password": password})
     except Exception as exc:  # pragma: no cover - network/dupe-email errors
         return None, "Could not create account: %s" % _short(exc)
@@ -146,7 +180,7 @@ def _register_supabase(store, username, password, email):
     # Create the linked LOCAL row. We still store a bcrypt hash so the local
     # row is self-consistent, but Supabase is the credential authority here.
     ph = hash_password(password)
-    uid = store.create_user(username, ph)
+    uid = store.create_user(username, ph, email=reg_email)
     if uid is None:
         # Local username race/collision: treat as taken (Supabase user may have
         # been created; that is acceptable and can be reclaimed on retry).
@@ -167,9 +201,13 @@ def _authenticate_supabase(store, username, password):
     client = _supabase_client()
     if client is None:  # pragma: no cover - misconfigured at runtime
         return None, "Accounts are unavailable right now."
+    # Authenticate against the REAL email stored on the local row at signup;
+    # fall back to the synthesized placeholder only for legacy rows without a
+    # stored email.
+    login_email = _derive_email(username, local.get("email"))
     try:
         client.auth.sign_in_with_password(
-            {"email": _derive_email(username, None), "password": password})
+            {"email": login_email, "password": password})
     except Exception:  # pragma: no cover - wrong creds / network
         return None, generic
     return {"id": local["id"], "username": local["username"]}, None
@@ -180,20 +218,36 @@ def _short(exc):
     return str(exc).splitlines()[0][:200] if str(exc) else exc.__class__.__name__
 
 
-def send_password_reset(username_or_email, redirect_to=None):
+def send_password_reset(username_or_email, redirect_to=None, store=None):
     """Trigger Supabase's password-reset email flow. Returns (ok, error).
 
     Delegates entirely to Supabase (it sends the email). A no-op with a clear
     message when Supabase is unconfigured. Never reveals whether an address
     exists (always reports success to the caller on the happy path).
+
+    The identifier may be an email (used directly) or a username; for a
+    username we resolve the REAL email stored on the local row (via ``store``)
+    so the reset email goes to the user's actual address rather than the
+    synthesized placeholder.
     """
     if not supabase_configured():
         return False, "Password reset is unavailable."
     client = _supabase_client()
     if client is None:  # pragma: no cover
         return False, "Password reset is unavailable."
-    email = _derive_email(username_or_email, username_or_email
-                          if "@" in (username_or_email or "") else None)
+    identifier = (username_or_email or "").strip()
+    if "@" in identifier:
+        # Caller supplied an email directly: use it as-is.
+        email = identifier
+    else:
+        # Username: prefer the REAL email stored on the local row; fall back to
+        # the synthesized placeholder only for legacy rows without one.
+        stored_email = None
+        if store is not None:
+            local = store.get_user_by_username(identifier)
+            if local is not None:
+                stored_email = local.get("email")
+        email = _derive_email(identifier, stored_email)
     try:
         opts = {"redirect_to": redirect_to} if redirect_to else None
         if opts:
@@ -240,6 +294,13 @@ def register_user(store, username, password, email=None):
     err = validate_password(password)
     if err:
         return None, err
+    # A REAL email is required at signup so Supabase confirmation / password-
+    # reset emails reach the user. Validated in BOTH the Supabase and bcrypt-
+    # local paths; the normalized (stripped) address is stored on the local row.
+    email = (email or "").strip()
+    err = validate_email(email)
+    if err:
+        return None, err
     # Case-insensitive uniqueness is friendlier: reject a new username that
     # collides with an existing one ignoring case (e.g. 'Alice' vs 'alice').
     # This is a pre-check for a clear error message; the DB UNIQUE constraint
@@ -259,7 +320,7 @@ def register_user(store, username, password, email=None):
 
     # --- bcrypt-local fallback (default when Supabase is unconfigured) ---
     ph = hash_password(password)
-    uid = store.create_user(username, ph)
+    uid = store.create_user(username, ph, email=email)
     if uid is None:
         # Lost a race (or other insert failure): treat as taken.
         return None, "That username is already taken."

@@ -24,6 +24,12 @@
       <input id="username" name="username" type="text" autocomplete="username"
              autocapitalize="none" spellcheck="false" required />
 
+      {% if mode == 'register' %}
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" autocomplete="email"
+             autocapitalize="none" spellcheck="false" required />
+      {% endif %}
+
       <label for="password">Password</label>
       <input id="password" name="password" type="password"
              autocomplete="{{ 'new-password' if mode == 'register' else 'current-password' }}" required />
@@ -38,6 +44,7 @@
       <p class="hint" id="authHint">
         {% if mode == 'register' %}
           Username: 3&ndash;32 letters, digits, or underscores. Password: at least 8 characters.
+          Email is required so we can send account confirmation and password-reset messages.
           Supply your FIDE ID to seed your starting FIDE ratings (any control you
           are unrated in starts at 1400).
         {% else %}

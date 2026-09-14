@@ -141,6 +141,7 @@ class Store:
                 " id SERIAL PRIMARY KEY,"
                 " username TEXT UNIQUE NOT NULL,"
                 " password_hash TEXT NOT NULL,"
+                " email TEXT,"
                 " fide_blitz DOUBLE PRECISION NOT NULL DEFAULT 1400,"
                 " fide_rapid DOUBLE PRECISION NOT NULL DEFAULT 1400,"
                 " fide_classical DOUBLE PRECISION NOT NULL DEFAULT 1400,"
@@ -274,6 +275,7 @@ class Store:
                 " id INTEGER PRIMARY KEY AUTOINCREMENT,"
                 " username TEXT UNIQUE NOT NULL,"
                 " password_hash TEXT NOT NULL,"
+                " email TEXT,"
                 " fide_blitz REAL NOT NULL DEFAULT 1400,"
                 " fide_rapid REAL NOT NULL DEFAULT 1400,"
                 " fide_classical REAL NOT NULL DEFAULT 1400,"
@@ -412,6 +414,11 @@ class Store:
     # (column_name, postgres_type, sqlite_type, default_clause_or_None)
     _MIGRATION_COLUMNS = {
         "users": [
+            # Real signup email so Supabase confirmation / password-reset emails
+            # reach the user. Nullable (default NULL) so any pre-existing row
+            # survives the migration; new signups always store a validated
+            # address via create_user(..., email=...).
+            ("email", "TEXT", "TEXT", None),
             ("fide_blitz", "DOUBLE PRECISION", "REAL", "1400"),
             ("fide_rapid", "DOUBLE PRECISION", "REAL", "1400"),
             ("fide_classical", "DOUBLE PRECISION", "REAL", "1400"),
@@ -537,15 +544,18 @@ class Store:
 
     # -- user operations ---------------------------------------------------
 
-    def create_user(self, username, password_hash):
+    def create_user(self, username, password_hash, email=None):
         """Insert a new user. Returns the new user id, or None if the username
-        is already taken (UNIQUE violation) or on any insert error."""
+        is already taken (UNIQUE violation) or on any insert error.
+
+        ``email`` is the real signup email (nullable) used for Supabase
+        confirmation / password-reset delivery."""
         try:
             if self.backend == "postgres":
                 row = self._execute(
-                    "INSERT INTO users (username, password_hash)"
-                    " VALUES (%s, %s) RETURNING id",
-                    (username, password_hash), fetch="one", commit=True)
+                    "INSERT INTO users (username, password_hash, email)"
+                    " VALUES (%s, %s, %s) RETURNING id",
+                    (username, password_hash, email), fetch="one", commit=True)
                 return row[0] if row else None
             else:
                 # sqlite
@@ -553,8 +563,9 @@ class Store:
                     conn = self._connect()
                     cur = conn.cursor()
                     cur.execute(
-                        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-                        (username, password_hash))
+                        "INSERT INTO users (username, password_hash, email)"
+                        " VALUES (?, ?, ?)",
+                        (username, password_hash, email))
                     conn.commit()
                     return cur.lastrowid
         except Exception:
@@ -562,14 +573,16 @@ class Store:
             return None
 
     def get_user_by_username(self, username):
-        """Return (id, username, password_hash) or None (exact-match)."""
+        """Return (id, username, password_hash, email) or None (exact-match)."""
         ph = self._placeholder()
         row = self._execute(
-            "SELECT id, username, password_hash FROM users WHERE username = %s" % ph,
+            "SELECT id, username, password_hash, email FROM users"
+            " WHERE username = %s" % ph,
             (username,), fetch="one")
         if not row:
             return None
-        return {"id": row[0], "username": row[1], "password_hash": row[2]}
+        return {"id": row[0], "username": row[1], "password_hash": row[2],
+                "email": row[3]}
 
     def username_exists_ci(self, username):
         """Return True if a user with this username exists, comparing

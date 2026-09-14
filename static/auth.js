@@ -31,6 +31,10 @@ if (authForm) {
       const url = mode === "register" ? "/api/register" : "/api/login";
       const body = { username, password };
       if (mode === "register") {
+        // Required real email: Supabase sends confirmation / password-reset
+        // mail here. The server re-validates and returns a clear error.
+        const email = (document.getElementById("email") || {}).value || "";
+        body.email = email.trim();
         // Optional FIDE ID: seeds the player's starting FIDE ratings server-side.
         const fideId = (document.getElementById("fideId") || {}).value || "";
         if (fideId.trim()) body.fide_id = fideId.trim();

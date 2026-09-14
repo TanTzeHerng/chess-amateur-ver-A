@@ -364,7 +364,8 @@ def api_forgot_password():
     if not identifier:
         return jsonify({"error": "Enter your username or email."}), 400
     redirect_to = data.get("redirect_to")
-    ok, err = auth.send_password_reset(identifier, redirect_to=redirect_to)
+    ok, err = auth.send_password_reset(identifier, redirect_to=redirect_to,
+                                       store=STORE)
     if not ok:
         return jsonify({"error": err or "Password reset is unavailable."}), 503
     # Uniform success response (does not leak whether the account exists).

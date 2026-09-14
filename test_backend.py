@@ -575,7 +575,8 @@ def test_flask_history_page_renders():
     import app as flask_app
     c = flask_app.app.test_client()
     r = c.post("/api/register", json={"username": "histuser",
-                                      "password": "pw123456"})
+                                      "password": "pw123456",
+                                      "email": "histuser@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
     uid = flask_app.STORE.get_user_by_username("histuser")["id"]
     flask_app.STORE.finish_game(
@@ -631,7 +632,8 @@ def test_flask_ratings_reflect_update_end_to_end():
     # --- (a) game-ending move (time forfeit) returns the POST-update rating ---
     c = flask_app.app.test_client()
     r = c.post("/api/register", json={"username": "rateduser1",
-                                      "password": "pw12345678"})
+                                      "password": "pw12345678",
+                                      "email": "rateduser1@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
     uid = flask_app.STORE.get_user_by_username("rateduser1")["id"]
     # FIDE game, white, 3+2 blitz (base 180, inc 2 -> time_class blitz).
@@ -669,7 +671,8 @@ def test_flask_ratings_reflect_update_end_to_end():
     # --- (b) /api/resign returns the updated player_rating -------------------
     c2 = flask_app.app.test_client()
     r = c2.post("/api/register", json={"username": "rateduser2",
-                                       "password": "pw12345678"})
+                                       "password": "pw12345678",
+                                       "email": "rateduser2@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
     uid2 = flask_app.STORE.get_user_by_username("rateduser2")["id"]
     r = c2.post("/api/new", json={"human_color": "white", "mode": "rated",
@@ -695,7 +698,8 @@ def test_flask_ratings_reflect_update_end_to_end():
     # --- (c) /api/in-progress carries ratings (rated) / null (casual) --------
     c3 = flask_app.app.test_client()
     r = c3.post("/api/register", json={"username": "rateduser3",
-                                       "password": "pw12345678"})
+                                       "password": "pw12345678",
+                                       "email": "rateduser3@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
     r = c3.post("/api/new", json={"human_color": "white", "mode": "rated",
                                   "hours": 0, "minutes": 5, "seconds": 0,
@@ -708,7 +712,8 @@ def test_flask_ratings_reflect_update_end_to_end():
 
     c4 = flask_app.app.test_client()
     r = c4.post("/api/register", json={"username": "casualuser",
-                                       "password": "pw12345678"})
+                                       "password": "pw12345678",
+                                       "email": "casualuser@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
     r = c4.post("/api/new", json={"human_color": "white", "mode": "casual",
                                   "hours": 0, "minutes": 5, "seconds": 0,
@@ -739,7 +744,8 @@ def test_flask_delete_account():
     # (b) Signed in -> account + games removed.
     c = flask_app.app.test_client()
     r = c.post("/api/register", json={"username": "deluser",
-                                      "password": "pw12345678"})
+                                      "password": "pw12345678",
+                                      "email": "deluser@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
     uid = flask_app.STORE.get_user_by_username("deluser")["id"]
     # Give the user a finished game so we can prove the cascade delete.
@@ -775,20 +781,23 @@ def test_flask_duplicate_username_rejected():
 
     c1 = flask_app.app.test_client()
     r = c1.post("/api/register", json={"username": "dupuser",
-                                       "password": "pw12345678"})
+                                       "password": "pw12345678",
+                                       "email": "dupuser@example.com"})
     assert r.status_code == 200, r.get_data(as_text=True)
 
     # Exact duplicate -> 400 with a clear "already taken" message.
     c2 = flask_app.app.test_client()
     r = c2.post("/api/register", json={"username": "dupuser",
-                                       "password": "different1"})
+                                       "password": "different1",
+                                       "email": "dupuser2@example.com"})
     assert r.status_code == 400, r.get_data(as_text=True)
     assert "taken" in (r.get_json().get("error") or "").lower(), r.get_json()
 
     # Case-insensitive near-duplicate is also rejected.
     c3 = flask_app.app.test_client()
     r = c3.post("/api/register", json={"username": "DupUser",
-                                       "password": "different2"})
+                                       "password": "different2",
+                                       "email": "dupuser3@example.com"})
     assert r.status_code == 400, r.get_data(as_text=True)
     assert "taken" in (r.get_json().get("error") or "").lower(), r.get_json()
 
@@ -943,7 +952,8 @@ def test_flask_collections_endpoints_auth_and_ownership():
     # (b) Signed-in user: create nested folders + assign a game.
     c = flask_app.app.test_client()
     assert c.post("/api/register", json={"username": "colweb",
-                                         "password": "pw12345678"}).status_code == 200
+                                         "password": "pw12345678",
+                                         "email": "colweb@example.com"}).status_code == 200
     uid = flask_app.STORE.get_user_by_username("colweb")["id"]
     r = c.post("/api/collections", json={"name": "Parent"})
     assert r.status_code == 200, r.get_data(as_text=True)
@@ -970,7 +980,8 @@ def test_flask_collections_endpoints_auth_and_ownership():
     # (c) A second user cannot touch the first user's collections.
     c2 = flask_app.app.test_client()
     assert c2.post("/api/register", json={"username": "colweb2",
-                                          "password": "pw12345678"}).status_code == 200
+                                          "password": "pw12345678",
+                                          "email": "colweb2@example.com"}).status_code == 200
     # Their own listing does not include the first user's folders.
     assert c2.get("/api/collections").get_json()["collections"] == []
     # Rename/delete another user's collection -> 404 (not found for them).
@@ -1112,6 +1123,7 @@ def test_register_full_flow_with_fide_id_bcrypt_path():
         c = flask_app.app.test_client()
         r = c.post("/api/register", json={"username": "fideuser",
                                           "password": "pw12345678",
+                                          "email": "fideuser@example.com",
                                           "fide_id": "1503014"})
         assert r.status_code == 200, r.get_data(as_text=True)
         uid = flask_app.STORE.get_user_by_username("fideuser")["id"]
@@ -1135,19 +1147,58 @@ def test_bcrypt_fallback_when_supabase_unconfigured():
     assert auth.supabase_configured() is False
     st = Store("sqlite:///:memory:")
 
-    user, err = auth.register_user(st, "bcryptonly", "pw12345678")
+    user, err = auth.register_user(st, "bcryptonly", "pw12345678",
+                                   email="bcryptonly@example.com")
     assert err is None and user is not None, (user, err)
+    # The real email is persisted on the local row.
+    assert st.get_user_by_username("bcryptonly")["email"] == \
+        "bcryptonly@example.com"
     # Login succeeds with the right password, fails with the wrong one.
     ok, err = auth.authenticate_user(st, "bcryptonly", "pw12345678")
     assert err is None and ok["username"] == "bcryptonly", (ok, err)
     bad, err = auth.authenticate_user(st, "bcryptonly", "wrongpass1")
     assert bad is None and err, (bad, err)
     # Duplicate username (exact + case-insensitive) rejected.
-    dup, err = auth.register_user(st, "bcryptonly", "another12")
+    dup, err = auth.register_user(st, "bcryptonly", "another12",
+                                  email="dup@example.com")
     assert dup is None and "taken" in err.lower(), (dup, err)
-    dup2, err = auth.register_user(st, "BcryptOnly", "another12")
+    dup2, err = auth.register_user(st, "BcryptOnly", "another12",
+                                   email="dup2@example.com")
     assert dup2 is None and "taken" in err.lower(), (dup2, err)
     print("PASS bcrypt fallback register/login + duplicate rejection (Supabase unset)")
+
+
+def test_validate_email_and_email_required_at_signup():
+    """Real-email signup: validate_email accepts sane addresses and rejects
+    obvious junk, and register_user REQUIRES + persists a valid email in the
+    bcrypt-local path."""
+    import auth
+    from storage import Store
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    # Valid addresses -> None (no error).
+    for good in ("a@b.co", "user.name+tag@sub.example.com",
+                 "  spaced@example.com  "):
+        assert auth.validate_email(good) is None, good
+    # Invalid addresses -> an error string.
+    for bad in ("", None, "noatsign.com", "two@@example.com", "a@b",
+                "@example.com", "user@", "user@.com", "user@example.",
+                "user@ex..com", 12345):
+        assert isinstance(auth.validate_email(bad), str) and \
+            auth.validate_email(bad), bad
+
+    st = Store("sqlite:///:memory:")
+    # Missing email is rejected (email genuinely required now).
+    u, err = auth.register_user(st, "needsmail", "pw12345678")
+    assert u is None and err and "email" in err.lower(), (u, err)
+    u, err = auth.register_user(st, "needsmail", "pw12345678", email="nope")
+    assert u is None and err, (u, err)
+    # A valid email registers and is stored (stripped/normalized).
+    u, err = auth.register_user(st, "hasmail", "pw12345678",
+                                email="  Player@Example.com  ")
+    assert err is None and u is not None, (u, err)
+    assert st.get_user_by_username("hasmail")["email"] == "Player@Example.com"
+    print("PASS validate_email + email required and persisted at signup")
 
 
 def test_storage_supabase_and_fide_id_columns():
@@ -1161,6 +1212,15 @@ def test_storage_supabase_and_fide_id_columns():
         "SELECT supabase_user_id, fide_id FROM users WHERE id = ?",
         (uid,), fetch="one")
     assert row == (None, None), row
+    # email column exists (idempotent migration) and is NULL when not supplied.
+    row = st._execute("SELECT email FROM users WHERE id = ?", (uid,),
+                      fetch="one")
+    assert row == (None,), row
+    assert st.get_user_by_username("linkme")["email"] is None
+    # create_user persists a supplied email, and get_user_by_username returns it.
+    uid2 = st.create_user("withmail", "hash", email="withmail@example.com")
+    assert st.get_user_by_username("withmail")["email"] == \
+        "withmail@example.com"
     # Link + lookup by supabase id.
     st.set_supabase_id(uid, "sb-uuid-123")
     got = st.get_user_by_supabase_id("sb-uuid-123")
@@ -1552,7 +1612,8 @@ def _register_fide_user(client, username=None):
         _FIDE_USER_SEQ[0] += 1
         username = "tbuser%d" % _FIDE_USER_SEQ[0]
     r = client.post("/api/register", json={"username": username,
-                                           "password": "pw12345678"})
+                                           "password": "pw12345678",
+                                           "email": "%s@example.com" % username})
     assert r.status_code == 200, r.get_data(as_text=True)
 
 
@@ -1826,7 +1887,8 @@ def test_flask_custom_position_casual():
     # casual, so use a logged-in user to actually exercise rated).
     c2 = flask_app.app.test_client()
     rr = c2.post("/api/register", json={"username": "customuser",
-                                        "password": "pw12345678"})
+                                        "password": "pw12345678",
+                                        "email": "customuser@example.com"})
     assert rr.status_code == 200, rr.get_data(as_text=True)
     r = c2.post("/api/new", json={"human_color": "white", "mode": "rated",
                                   "hours": 0, "minutes": 5, "seconds": 0,
@@ -2300,7 +2362,8 @@ def test_flask_puzzle_endpoints_auth_persist_and_rating():
 
     c = flask_app.app.test_client()
     assert c.post("/api/register", json={"username": "puzzler",
-                                         "password": "pw12345678"}).status_code == 200
+                                         "password": "pw12345678",
+                                         "email": "puzzler@example.com"}).status_code == 200
     uid = flask_app.STORE.get_user_by_username("puzzler")["id"]
     # New user's puzzle rating is 1400.
     assert flask_app.STORE.get_user_by_id(uid)["puzzle_rating"] == 1400.0
@@ -2379,7 +2442,8 @@ def test_flask_finished_game_appends_rating_history():
     import app as flask_app
     c = flask_app.app.test_client()
     assert c.post("/api/register", json={"username": "rhgamer",
-                                          "password": "pw12345678"}).status_code == 200
+                                          "password": "pw12345678",
+                                          "email": "rhgamer@example.com"}).status_code == 200
     uid = flask_app.STORE.get_user_by_username("rhgamer")["id"]
     assert flask_app.STORE.list_rating_history(uid) == []
 
@@ -2456,7 +2520,8 @@ def test_flask_dashboard_auth_and_series_window():
 
     c = flask_app.app.test_client()
     assert c.post("/api/register", json={"username": "dashuser",
-                                          "password": "pw12345678"}).status_code == 200
+                                          "password": "pw12345678",
+                                          "email": "dashuser@example.com"}).status_code == 200
     uid = flask_app.STORE.get_user_by_username("dashuser")["id"]
     # Seed history across several days and kinds. Use 00:00Z (== 08:00 GMT+8) so
     # each event lands squarely inside a single GMT+8 day.
@@ -2500,7 +2565,8 @@ def test_flask_dashboard_auth_and_series_window():
 
     # A user with NO history gets empty series and null bounds under 'All'.
     assert c.post("/api/register", json={"username": "emptyuser",
-                                         "password": "pw12345678"}).status_code == 200
+                                         "password": "pw12345678",
+                                         "email": "emptyuser@example.com"}).status_code == 200
     empty = c.get("/api/dashboard").get_json()
     assert empty["from"] is None, empty
     assert all(empty["series"][k] == [] for k in empty["kinds"]), empty
@@ -2517,7 +2583,8 @@ def test_flask_puzzle_solve_appends_puzzle_history():
 
     c = flask_app.app.test_client()
     assert c.post("/api/register", json={"username": "pzhist",
-                                          "password": "pw12345678"}).status_code == 200
+                                          "password": "pw12345678",
+                                          "email": "pzhist@example.com"}).status_code == 200
     uid = flask_app.STORE.get_user_by_username("pzhist")["id"]
     assert flask_app.STORE.list_rating_history(uid, kind="puzzle") == []
 
@@ -2555,7 +2622,8 @@ def test_flask_demo_gate_seen_and_auth():
 
     c = flask_app.app.test_client()
     assert c.post("/api/register", json={"username": "demouser",
-                                         "password": "pw12345678"}).status_code == 200
+                                         "password": "pw12345678",
+                                         "email": "demouser@example.com"}).status_code == 200
     uid = flask_app.STORE.get_user_by_username("demouser")["id"]
 
     # (a) a freshly-registered account is shown the demo (gated on demo_pending).
@@ -2667,6 +2735,7 @@ def main():
     test_signup_fide_seeding_maps_and_defaults()
     test_register_full_flow_with_fide_id_bcrypt_path()
     test_bcrypt_fallback_when_supabase_unconfigured()
+    test_validate_email_and_email_required_at_signup()
     test_storage_supabase_and_fide_id_columns()
     test_forgot_password_noop_without_supabase()
     # FEAT-005: Syzygy setoption/download, Polyglot book, custom position.
