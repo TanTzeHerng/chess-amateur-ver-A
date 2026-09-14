@@ -14,10 +14,13 @@ Security notes:
   * verify_password is constant-time (bcrypt.checkpw) and tolerant of malformed
     stored hashes (returns False rather than raising).
 """
+import logging
 import os
 import re
 
 import bcrypt
+
+_log = logging.getLogger(__name__)
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 USERNAME_MIN, USERNAME_MAX = 3, 32
@@ -142,7 +145,13 @@ def _supabase_client(service=False):
     try:
         from supabase import create_client
         return create_client(url, key)
-    except Exception:  # pragma: no cover - library/network issue is non-fatal
+    except Exception as exc:  # pragma: no cover - library/network issue is non-fatal
+        # Never take the site down: return None so callers fall back to the
+        # guest/bcrypt path. But LOG the real reason (e.g. "Invalid API key")
+        # so a future auth misconfiguration surfaces in the deploy logs instead
+        # of silently degrading to "Accounts are unavailable right now."
+        _log.error("Supabase client init failed (%s key): %s",
+                   "service" if service else "anon", _short(exc))
         return None
 
 

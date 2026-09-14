@@ -6,7 +6,7 @@ gunicorn==23.0.0
 # Supabase Auth (identity + password-reset emails) is used ONLY when
 # SUPABASE_URL/SUPABASE_ANON_KEY are configured; the app falls back to the
 # bcrypt-local-auth path when they are unset (guest mode + offline tests).
-supabase==2.15.1
+supabase==2.31.0
 # HTTP client for the FIDE ratings lookup at signup (fide.py).
 requests==2.32.3
 # zstandard: STREAM-decompress the ~5GB Lichess puzzle .zst dump for the
