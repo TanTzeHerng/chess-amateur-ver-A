@@ -2693,6 +2693,85 @@ def test_storage_demo_pending_roundtrip():
     print("PASS storage demo_pending roundtrip + get_user_by_id")
 
 
+def test_migration_boolean_default_maps_to_sql_literal():
+    """PROD BUGFIX: a BOOLEAN Postgres migration column must emit a SQL boolean
+    literal default (FALSE/TRUE), never the integer literal 0/1.
+
+    Postgres rejects `ADD COLUMN demo_pending BOOLEAN DEFAULT 0` ("column is of
+    type boolean but default expression is of type integer"), and because the
+    migrations ran in one transaction that error aborted the whole batch and
+    disabled the Store (guest mode). _pg_default_literal() is the DB-agnostic
+    core of the fix: it maps the SQLite-flavoured integer default to the right
+    Postgres boolean literal while leaving every other type untouched. It is
+    also asserted that the demo_pending migration entry keeps its SQLite
+    integer default (so SQLite stays INTEGER NOT NULL DEFAULT 0) and that the
+    semantics are FALSE (demo NOT shown to existing/migrated users)."""
+    from storage import Store
+    # BOOLEAN maps the integer-ish default to a SQL boolean literal.
+    assert Store._pg_default_literal("BOOLEAN", "0") == "FALSE"
+    assert Store._pg_default_literal("boolean", 0) == "FALSE"
+    assert Store._pg_default_literal("BOOLEAN", "1") == "TRUE"
+    assert Store._pg_default_literal("BOOLEAN", "FALSE") == "FALSE"
+    assert Store._pg_default_literal("BOOLEAN", "TRUE") == "TRUE"
+    # Non-boolean types pass through unchanged (valid Postgres literals).
+    assert Store._pg_default_literal("INTEGER", "0") == "0"
+    assert Store._pg_default_literal("DOUBLE PRECISION", "1400") == "1400"
+    assert Store._pg_default_literal("TEXT", None) is None
+    # The demo_pending migration entry: BOOLEAN on pg, INTEGER on sqlite, and
+    # the stored default is the integer 0 -> FALSE for Postgres (demo NOT
+    # shown to migrated users).
+    entry = [c for c in Store._MIGRATION_COLUMNS["users"]
+             if c[0] == "demo_pending"][0]
+    name, pg_type, sq_type, default = entry
+    assert pg_type == "BOOLEAN" and sq_type == "INTEGER", entry
+    assert Store._pg_default_literal(pg_type, default) == "FALSE", entry
+    print("PASS migration BOOLEAN default maps to SQL literal (demo_pending -> FALSE)")
+
+
+def test_migration_failing_ddl_does_not_abort_remaining_columns():
+    """PROD BUGFIX: one failing migration statement must NOT abort the batch.
+
+    Simulates a single bad ALTER by injecting a bogus migration column with an
+    invalid type. On the real Postgres this poisoned the transaction so every
+    later ADD COLUMN failed with "current transaction is aborted" and the whole
+    Store was disabled. After the fix, _migrate_columns isolates each ALTER
+    (commit on success / rollback on failure) so the bogus column is skipped
+    (logged as a note) while the LEGITIMATE columns before AND after it are
+    still added and the Store stays enabled."""
+    import storage as storage_mod
+    from storage import Store
+    orig = Store._MIGRATION_COLUMNS
+    # Start from a minimal users/games table (no post-release columns) so the
+    # migration actually has work to do, then wedge a failing statement between
+    # two real columns.
+    poisoned = {
+        "users": [
+            ("email", "TEXT", "TEXT", None),
+            # Syntactically invalid DDL on BOTH backends (a dangling DEFAULT
+            # clause) -> this ALTER must fail...
+            ("bogus_col", "TEXT DEFAULT (", "TEXT DEFAULT (", None),
+            # ...but this one AFTER the failure must still be applied.
+            ("demo_pending", "BOOLEAN", "INTEGER", "0"),
+        ],
+    }
+    try:
+        Store._MIGRATION_COLUMNS = poisoned
+        st = Store("sqlite:///:memory:")
+        # A failing DDL in the batch must NOT disable the store.
+        assert st.enabled, "store must stay enabled despite one failing ALTER"
+        conn = st._connect()
+        cur = conn.cursor()
+        existing = st._existing_columns(cur, "users")
+        # The real columns on BOTH sides of the failure got added...
+        assert "email" in existing, existing
+        assert "demo_pending" in existing, existing
+        # ...and the bogus one was skipped, not fatal.
+        assert "bogus_col" not in existing, existing
+    finally:
+        Store._MIGRATION_COLUMNS = orig
+    print("PASS migration isolates a failing DDL and still adds remaining columns")
+
+
 def main():
     test_engine()
     test_single_process_invariant_across_respawn()
@@ -2783,6 +2862,11 @@ def main():
     # FEAT-001 (follow-up): onboarding demo is new-users-only (demo_pending).
     test_storage_demo_pending_roundtrip()
     test_flask_demo_gate_seen_and_auth()
+    # PROD BUGFIX: BOOLEAN-with-integer-default migration + per-statement
+    # isolation so one failing ALTER can't abort the batch (Postgres-only bug
+    # that disabled the Store -> guest mode; reproduced on SQLite via helpers).
+    test_migration_boolean_default_maps_to_sql_literal()
+    test_migration_failing_ddl_does_not_abort_remaining_columns()
     httpd, server = start_server()
     try:
         # new game as white

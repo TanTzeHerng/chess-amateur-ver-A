@@ -381,27 +381,39 @@ class Store:
                 "CREATE INDEX IF NOT EXISTS rating_history_user_kind_at"
                 " ON rating_history(user_id, kind, at)"
             )
+        # All schema statements are IF NOT EXISTS / idempotent. They are run
+        # one at a time and each is committed on success so a single failing
+        # statement cannot abort the whole batch (on Postgres a failed
+        # statement aborts the transaction and every later statement then
+        # fails with "current transaction is aborted", which would disable the
+        # Store and force guest mode). On failure we roll back to a clean state
+        # and continue with the remaining statements.
+        schema_statements = [
+            users_sql, games_sql, index_sql, collections_sql,
+            game_collections_sql, puzzles_sql, puzzles_index_sql,
+            truncation_stats_sql, truncation_stats_rating_index_sql,
+            truncation_stats_removed_index_sql, rating_history_sql,
+            rating_history_index_sql,
+        ]
         conn = self._connect()
         try:
             cur = conn.cursor()
-            cur.execute(users_sql)
-            cur.execute(games_sql)
-            cur.execute(index_sql)
-            cur.execute(collections_sql)
-            cur.execute(game_collections_sql)
-            cur.execute(puzzles_sql)
-            cur.execute(puzzles_index_sql)
-            cur.execute(truncation_stats_sql)
-            cur.execute(truncation_stats_rating_index_sql)
-            cur.execute(truncation_stats_removed_index_sql)
-            cur.execute(rating_history_sql)
-            cur.execute(rating_history_index_sql)
-            conn.commit()
+            for stmt in schema_statements:
+                try:
+                    cur.execute(stmt)
+                    conn.commit()
+                except Exception as exc:
+                    try:
+                        conn.rollback()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
+                    print("[storage] schema note: %s" % exc)
             # Idempotent migration: add columns introduced after the original
             # accounts release, so an EXISTING database (whose users/games
             # tables predate time-controls/ratings) gains them WITHOUT dropping
             # data. CREATE TABLE IF NOT EXISTS alone never alters existing
             # tables, so this is required for a clean upgrade on Render Postgres.
+            # _migrate_columns isolates each ALTER (commit/rollback per column).
             self._migrate_columns(conn, cur)
             conn.commit()
         finally:
@@ -412,6 +424,14 @@ class Store:
 
     # Columns added after the original accounts release, with per-backend types.
     # (column_name, postgres_type, sqlite_type, default_clause_or_None)
+    #
+    # The default is written literally into the ADD COLUMN DDL. It MUST be a
+    # valid literal for BOTH backends' declared type -- e.g. a BOOLEAN Postgres
+    # column CANNOT take the integer literal "0" (Postgres raises "column is of
+    # type boolean but default expression is of type integer" and, running in a
+    # transaction, that error would abort the whole migration batch). Such
+    # boolean-typed columns keep the SQLite integer default (0/1) but are mapped
+    # to the matching SQL boolean literal for Postgres by _pg_default_literal().
     _MIGRATION_COLUMNS = {
         "users": [
             # Real signup email so Supabase confirmation / password-reset emails
@@ -493,6 +513,22 @@ class Store:
         cur.execute("PRAGMA table_info(%s)" % table)
         return {r[1] for r in cur.fetchall()}
 
+    @staticmethod
+    def _pg_default_literal(pg_type, default):
+        """Map a migration default to a literal valid for its POSTGRES type.
+
+        The migration table stores SQLite-flavoured defaults (booleans as the
+        integer 0/1). Postgres is strict about types: `ADD COLUMN x BOOLEAN
+        DEFAULT 0` fails ("column is of type boolean but default expression is
+        of type integer"). Translate the integer-ish default to a SQL boolean
+        literal for BOOLEAN columns; every other type is already a valid
+        Postgres literal (numbers, quoted TEXT, etc.), so pass it through.
+        """
+        if pg_type.upper() == "BOOLEAN":
+            return "FALSE" if str(default).strip() in ("0", "false", "FALSE",
+                                                       "False") else "TRUE"
+        return default
+
     def _migrate_columns(self, conn, cur):
         """Add any missing post-release columns to users/games (idempotent).
 
@@ -500,6 +536,16 @@ class Store:
         check PRAGMA table_info first. Newly added columns get their default so
         existing rows are backfilled (e.g. old users become 1400 FIDE / 0
         Rated; old games get increment 0). Safe to run on every boot.
+
+        ROBUSTNESS: each ALTER is isolated so one failing statement cannot
+        poison the rest. On Postgres a failed statement aborts the current
+        transaction ("current transaction is aborted, commands ignored...") and
+        every subsequent statement then fails too -- which previously disabled
+        the whole Store and forced guest mode. We therefore COMMIT after each
+        successful ALTER and ROLLBACK after a failure, so the connection is
+        always returned to a clean state and the remaining columns still get
+        added. SQLite runs each ALTER in autocommit-ish fashion already; the
+        commit/rollback calls are harmless there.
         """
         for table, cols in self._MIGRATION_COLUMNS.items():
             existing = self._existing_columns(cur, table)
@@ -509,11 +555,26 @@ class Store:
                 col_type = pg_type if self.backend == "postgres" else sq_type
                 ddl = "ALTER TABLE %s ADD COLUMN %s %s" % (table, name, col_type)
                 if default is not None:
-                    ddl += " DEFAULT %s" % default
+                    if self.backend == "postgres":
+                        literal = self._pg_default_literal(pg_type, default)
+                    else:
+                        literal = default
+                    ddl += " DEFAULT %s" % literal
                 try:
                     cur.execute(ddl)
-                except Exception as exc:  # pragma: no cover - defensive
-                    # A concurrent boot may have added it; ignore "exists".
+                    # Persist immediately so a later failure can't roll this
+                    # (successful) column back out of the batch.
+                    conn.commit()
+                except Exception as exc:
+                    # A concurrent boot may have added it, or the statement may
+                    # be otherwise invalid. Roll back so the transaction is
+                    # clean and the REMAINING columns can still be added rather
+                    # than every subsequent statement failing with "current
+                    # transaction is aborted".
+                    try:
+                        conn.rollback()
+                    except Exception:  # pragma: no cover - defensive
+                        pass
                     print("[storage] migration note for %s.%s: %s"
                           % (table, name, exc))
 
