@@ -336,9 +336,9 @@ def api_register():
     if not STORE.enabled:
         return jsonify({"error": "Accounts are unavailable right now."}), 503
     data = request.get_json(silent=True) or {}
-    user, err = auth.register_user(STORE, data.get("username"),
-                                   data.get("password"),
-                                   email=data.get("email"))
+    user, err, supabase_ok = auth.register_user(STORE, data.get("username"),
+                                                data.get("password"),
+                                                email=data.get("email"))
     if err:
         return jsonify({"error": err}), 400
     # FEAT-001 (follow-up): the onboarding demo is NEW-USERS-ONLY. Mark the demo
@@ -380,7 +380,42 @@ def api_register():
             app.logger.exception("FIDE seeding failed for user %s", user["id"])
     session.clear()
     session["uid"] = user["id"]
-    return jsonify({"user": user})
+    # Response flags (additive, non-sensitive) describing the Supabase email
+    # outcome so the client can react WITHOUT blocking account creation:
+    #   * supabase_attempted -- Supabase was CONFIGURED and an email sign_up was
+    #     ATTEMPTED for this signup.
+    #   * supabase -- the attempt SUCCEEDED and the row is Supabase/email-bound.
+    #   * email_bound -- mirrors `supabase` here (the account is bound to email).
+    # The client shows the "sign-up failed, using local fallback" popup ONLY
+    # when supabase_attempted is True AND supabase is False (configured-but-
+    # failed). When supabase_attempted is False (unconfigured / bcrypt mode)
+    # supabase is False too but NO popup shows -- these two cases are
+    # distinguished by supabase_attempted.
+    return jsonify({
+        "user": user,
+        "supabase_attempted": bool(auth.supabase_configured()),
+        "supabase": (supabase_ok is True),
+        "email_bound": (supabase_ok is True),
+    })
+
+
+@app.post("/api/link-supabase")
+def api_link_supabase():
+    """Retry binding the logged-in account to Supabase / email (best-effort).
+
+    Session-guarded. The client RESENDS the signup password; auth.link_supabase
+    _account verifies it against the stored bcrypt hash before attempting the
+    Supabase sign_up, so an arbitrary password cannot be set. Non-raising."""
+    user = _current_user()
+    if not user:
+        return jsonify({"error": "Not signed in."}), 401
+    data = request.get_json(silent=True) or {}
+    password = data.get("password")
+    ok, err, email_bound = auth.link_supabase_account(STORE, user["id"],
+                                                       password)
+    if not ok:
+        return jsonify({"error": err or "Could not link account."}), 400
+    return jsonify({"ok": True, "email_bound": bool(email_bound)})
 
 
 @app.post("/api/login")

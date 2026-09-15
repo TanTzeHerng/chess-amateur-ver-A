@@ -1303,9 +1303,11 @@ def test_bcrypt_fallback_when_supabase_unconfigured():
     assert auth.supabase_configured() is False
     st = Store("sqlite:///:memory:")
 
-    user, err = auth.register_user(st, "bcryptonly", "pw12345678",
-                                   email="bcryptonly@example.com")
+    user, err, supabase_ok = auth.register_user(
+        st, "bcryptonly", "pw12345678", email="bcryptonly@example.com")
     assert err is None and user is not None, (user, err)
+    # Supabase unconfigured -> supabase_ok is None (pure bcrypt mode).
+    assert supabase_ok is None, supabase_ok
     # The real email is persisted on the local row.
     assert st.get_user_by_username("bcryptonly")["email"] == \
         "bcryptonly@example.com"
@@ -1315,12 +1317,12 @@ def test_bcrypt_fallback_when_supabase_unconfigured():
     bad, err = auth.authenticate_user(st, "bcryptonly", "wrongpass1")
     assert bad is None and err, (bad, err)
     # Duplicate username (exact + case-insensitive) rejected.
-    dup, err = auth.register_user(st, "bcryptonly", "another12",
-                                  email="dup@example.com")
-    assert dup is None and "taken" in err.lower(), (dup, err)
-    dup2, err = auth.register_user(st, "BcryptOnly", "another12",
-                                   email="dup2@example.com")
-    assert dup2 is None and "taken" in err.lower(), (dup2, err)
+    dup, err, sok = auth.register_user(st, "bcryptonly", "another12",
+                                       email="dup@example.com")
+    assert dup is None and "taken" in err.lower() and sok is None, (dup, err)
+    dup2, err, sok = auth.register_user(st, "BcryptOnly", "another12",
+                                        email="dup2@example.com")
+    assert dup2 is None and "taken" in err.lower() and sok is None, (dup2, err)
     print("PASS bcrypt fallback register/login + duplicate rejection (Supabase unset)")
 
 
@@ -1345,14 +1347,14 @@ def test_validate_email_and_email_required_at_signup():
 
     st = Store("sqlite:///:memory:")
     # Missing email is rejected (email genuinely required now).
-    u, err = auth.register_user(st, "needsmail", "pw12345678")
-    assert u is None and err and "email" in err.lower(), (u, err)
-    u, err = auth.register_user(st, "needsmail", "pw12345678", email="nope")
-    assert u is None and err, (u, err)
+    u, err, sok = auth.register_user(st, "needsmail", "pw12345678")
+    assert u is None and err and "email" in err.lower() and sok is None, (u, err)
+    u, err, sok = auth.register_user(st, "needsmail", "pw12345678", email="nope")
+    assert u is None and err and sok is None, (u, err)
     # A valid email registers and is stored (stripped/normalized).
-    u, err = auth.register_user(st, "hasmail", "pw12345678",
-                                email="  Player@Example.com  ")
-    assert err is None and u is not None, (u, err)
+    u, err, sok = auth.register_user(st, "hasmail", "pw12345678",
+                                     email="  Player@Example.com  ")
+    assert err is None and u is not None and sok is None, (u, err)
     assert st.get_user_by_username("hasmail")["email"] == "Player@Example.com"
     print("PASS validate_email + email required and persisted at signup")
 
@@ -1404,6 +1406,556 @@ def test_forgot_password_noop_without_supabase():
     assert r.status_code == 501, r.get_data(as_text=True)
     assert "unavailable" in (r.get_json().get("error") or "").lower()
     print("PASS /api/forgot-password -> 501 no-op when Supabase unconfigured")
+
+
+# ==========================================================================
+# FEAT-002 (supabase-decouple-signup): email decoupled from the blocking
+# account-creation path; per-user login routing; /api/register outcome flags;
+# additive POST /api/link-supabase retry endpoint. Supabase is STUBBED by
+# monkeypatching auth._supabase_client (no network). Every test pops the
+# SUPABASE_* env in a finally block so it does not leak configured state into
+# later tests (the app module is imported once per process).
+# ==========================================================================
+
+
+class _FakeSupabaseUser:
+    def __init__(self, uid):
+        self.id = uid
+
+
+class _FakeSignUpResult:
+    def __init__(self, uid):
+        self.user = _FakeSupabaseUser(uid)
+
+
+class _FakeSupabaseAdmin:
+    """.auth.admin namespace exposing list_users(page, per_page). Returns the
+    pre-seeded users on page 1 and an empty list thereafter (single-page shape),
+    optionally raising a configured exception. Records list_users_calls so tests
+    can assert whether the admin lookup ran at all."""
+
+    def __init__(self, users=None, list_users_exc=None):
+        self._users = list(users or [])
+        self._list_users_exc = list_users_exc
+        self.list_users_calls = []
+
+    def list_users(self, page=None, per_page=None):
+        self.list_users_calls.append((page, per_page))
+        if self._list_users_exc is not None:
+            raise self._list_users_exc
+        # Single page of results; subsequent pages are empty (terminates paging).
+        if page in (None, 1):
+            return list(self._users)
+        return []
+
+
+class _FakeSupabaseAuth:
+    """.auth namespace exposing sign_up / sign_in_with_password / admin. sign_up
+    either raises (configured value) or returns a result with .user.id; sign_in
+    always succeeds unless sign_in_exc is set. The .admin namespace defaults to
+    an empty seeded user list so existing tests are unaffected."""
+
+    def __init__(self, sign_up_uid=None, sign_up_exc=None,
+                 sign_in_exc=None, admin_users=None, admin_list_users_exc=None):
+        self._sign_up_uid = sign_up_uid
+        self._sign_up_exc = sign_up_exc
+        self._sign_in_exc = sign_in_exc
+        self.sign_up_calls = []
+        self.sign_in_calls = []
+        self.admin = _FakeSupabaseAdmin(
+            users=admin_users, list_users_exc=admin_list_users_exc)
+
+    def sign_up(self, payload):
+        self.sign_up_calls.append(payload)
+        if self._sign_up_exc is not None:
+            raise self._sign_up_exc
+        return _FakeSignUpResult(self._sign_up_uid)
+
+    def sign_in_with_password(self, payload):
+        self.sign_in_calls.append(payload)
+        if self._sign_in_exc is not None:
+            raise self._sign_in_exc
+        return object()
+
+
+class _FakeSupabaseClient:
+    def __init__(self, **kw):
+        self.auth = _FakeSupabaseAuth(**kw)
+
+
+def test_register_supabase_signup_failure_falls_back_to_local():
+    """FEAT-002: Supabase CONFIGURED but sign_up raises -> the local bcrypt
+    account is STILL created (email stored, supabase_user_id NULL), FIDE
+    seeding runs on the fallback path, and the response reports
+    supabase_attempted True / supabase False / email_bound False. Also asserts
+    register_user returns supabase_ok False directly."""
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    # Configure Supabase so supabase_configured() is True.
+    os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+    os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+    import app as flask_app
+    import auth
+    import fide as fide_mod
+
+    saved_client = auth._supabase_client
+    saved_fetch = fide_mod.fetch_profile_html
+    # sign_up ALWAYS raises (email rate limit): forces the bcrypt fallback.
+    fake = _FakeSupabaseClient(
+        sign_up_exc=RuntimeError("email rate limit exceeded"))
+    auth._supabase_client = lambda service=False: fake
+    fide_mod.fetch_profile_html = lambda fid, timeout=8: (
+        '<div class="profile-standart"><span>1990</span></div>'
+        '<div class="profile-rapid"><span>1850</span></div>'
+        '<div class="profile-blitz"><span>1750</span></div>')
+    try:
+        assert auth.supabase_configured() is True
+        c = flask_app.app.test_client()
+        r = c.post("/api/register", json={"username": "sbfail",
+                                          "password": "pw12345678",
+                                          "email": "sbfail@example.com",
+                                          "fide_id": "1503014"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        body = r.get_json()
+        assert body["supabase_attempted"] is True, body
+        assert body["supabase"] is False, body
+        assert body["email_bound"] is False, body
+        # Local row exists with the stored email and a NULL supabase link.
+        row = flask_app.STORE.get_user_by_username("sbfail")
+        assert row is not None, "local row must exist on fallback"
+        assert row["email"] == "sbfail@example.com", row
+        assert not row.get("supabase_user_id"), row
+        # FIDE ratings were seeded on the fallback path.
+        u = flask_app.STORE.get_user_by_id(row["id"])
+        assert u["fide_classical"] == 1990.0, u
+        assert u["fide_blitz"] == 1750.0, u
+        # register_user returns supabase_ok False directly with the same stub.
+        du, derr, dok = auth.register_user(flask_app.STORE, "sbfail2",
+                                           "pw12345678",
+                                           email="sbfail2@example.com")
+        assert derr is None and du is not None, (du, derr)
+        assert dok is False, dok
+        assert not flask_app.STORE.get_user_by_username(
+            "sbfail2").get("supabase_user_id")
+    finally:
+        auth._supabase_client = saved_client
+        fide_mod.fetch_profile_html = saved_fetch
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS register: Supabase sign_up failure -> bcrypt fallback, seeded, "
+          "flags supabase_attempted/supabase/email_bound correct")
+
+
+def test_register_supabase_signup_success_links():
+    """FEAT-002: Supabase CONFIGURED and sign_up succeeds -> the local row is
+    linked (supabase_user_id set) and the response reports supabase True /
+    email_bound True."""
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+    os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+    import app as flask_app
+    import auth
+
+    saved_client = auth._supabase_client
+    fake = _FakeSupabaseClient(sign_up_uid="sb-123")
+    auth._supabase_client = lambda service=False: fake
+    try:
+        c = flask_app.app.test_client()
+        r = c.post("/api/register", json={"username": "sbok",
+                                          "password": "pw12345678",
+                                          "email": "sbok@example.com"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        body = r.get_json()
+        assert body["supabase_attempted"] is True, body
+        assert body["supabase"] is True, body
+        assert body["email_bound"] is True, body
+        row = flask_app.STORE.get_user_by_username("sbok")
+        assert row["supabase_user_id"] == "sb-123", row
+        assert row["email"] == "sbok@example.com", row
+    finally:
+        auth._supabase_client = saved_client
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS register: Supabase sign_up success links row, flags supabase/"
+          "email_bound True")
+
+
+def test_authenticate_routes_per_user():
+    """FEAT-002: authenticate_user routes PER-USER, not on the global flag. A
+    row WITH supabase_user_id authenticates via the Supabase stub (even with a
+    wrong bcrypt hash); a row WITHOUT it authenticates via bcrypt (right pw ok,
+    wrong pw rejected)."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    fake = _FakeSupabaseClient()  # sign_in_with_password succeeds
+    auth._supabase_client = lambda service=False: fake
+    try:
+        st = Store("sqlite:///:memory:")
+        # Linked row with a DELIBERATELY WRONG bcrypt hash: only the Supabase
+        # stub can authenticate it, proving per-user Supabase routing.
+        linked_id = st.create_user("linked", "not-a-valid-bcrypt-hash",
+                                   email="linked@example.com")
+        st.set_supabase_id(linked_id, "sb-linked")
+        # Unlinked (bcrypt-only) row.
+        bcrypt_id = st.create_user("plain", auth.hash_password("pw12345678"),
+                                   email="plain@example.com")
+        assert bcrypt_id is not None
+
+        # Linked user authenticates via Supabase (any password reaches the stub;
+        # bcrypt hash is intentionally invalid).
+        ok, err = auth.authenticate_user(st, "linked", "whatever-pw")
+        assert err is None and ok["id"] == linked_id, (ok, err)
+        assert fake.auth.sign_in_calls, "Supabase sign_in must be called"
+
+        # Unlinked user authenticates via bcrypt: right pw works, wrong fails.
+        ok, err = auth.authenticate_user(st, "plain", "pw12345678")
+        assert err is None and ok["id"] == bcrypt_id, (ok, err)
+        bad, err = auth.authenticate_user(st, "plain", "wrong-pw-1")
+        assert bad is None and err == "Incorrect username or password.", \
+            (bad, err)
+        # Unknown user -> generic error.
+        none, err = auth.authenticate_user(st, "ghost", "pw12345678")
+        assert none is None and err == "Incorrect username or password.", \
+            (none, err)
+    finally:
+        auth._supabase_client = saved_client
+    print("PASS authenticate_user routes per-user (Supabase-linked vs bcrypt)")
+
+
+def test_login_bcrypt_fallback_on_supabase_unavailable():
+    """FEAT-001 (task-supabase-auth-hardening): a Supabase-LINKED row whose
+    local password_hash is a REAL bcrypt hash of the correct password falls
+    back to bcrypt when Supabase is UNAVAILABLE. Covers both an
+    AuthRetryableError (HTTP 503 / status 0) and a raw httpx.ConnectError. With
+    the correct password authentication SUCCEEDS; with a wrong password it
+    returns the uniform generic error."""
+    from gotrue.errors import AuthRetryableError
+    import httpx
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    try:
+        for exc in (AuthRetryableError("backend unavailable", 503),
+                    httpx.ConnectError("connection refused")):
+            fake = _FakeSupabaseClient(sign_in_exc=exc)
+            auth._supabase_client = lambda service=False: fake
+            st = Store("sqlite:///:memory:")
+            # Linked row with a REAL bcrypt hash of the correct password.
+            uid = st.create_user(
+                "linked", auth.hash_password("correct-pw-123"),
+                email="linked@example.com")
+            st.set_supabase_id(uid, "sb-linked")
+
+            # Correct password -> bcrypt fallback logs the user in.
+            ok, err = auth.authenticate_user(st, "linked", "correct-pw-123")
+            assert err is None and ok["id"] == uid, (exc, ok, err)
+            assert fake.auth.sign_in_calls, "Supabase sign_in must be tried first"
+
+            # Wrong password -> uniform generic error (fallback rejects it).
+            bad, err = auth.authenticate_user(st, "linked", "wrong-pw-000")
+            assert bad is None and err == "Incorrect username or password.", \
+                (exc, bad, err)
+    finally:
+        auth._supabase_client = saved_client
+    print("PASS login bcrypt fallback on Supabase unavailability "
+          "(AuthRetryableError + raw httpx transport error)")
+
+
+def test_login_no_bcrypt_bypass_on_credential_rejection():
+    """FEAT-001: a Supabase-LINKED row whose local bcrypt hash WOULD match the
+    given password must NOT fall back to bcrypt when Supabase returns a
+    definitive credential rejection (AuthApiError). Proves no bcrypt bypass: a
+    wrong Supabase password is never salvaged by an old local hash."""
+    from gotrue.errors import AuthApiError
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    fake = _FakeSupabaseClient(
+        sign_in_exc=AuthApiError("Invalid login credentials", 400,
+                                 "invalid_credentials"))
+    auth._supabase_client = lambda service=False: fake
+    try:
+        st = Store("sqlite:///:memory:")
+        # The local bcrypt hash MATCHES the password we will submit, so if a
+        # bypass existed the login would (wrongly) succeed.
+        uid = st.create_user(
+            "linked", auth.hash_password("would-match-pw"),
+            email="linked@example.com")
+        st.set_supabase_id(uid, "sb-linked")
+
+        bad, err = auth.authenticate_user(st, "linked", "would-match-pw")
+        assert bad is None and err == "Incorrect username or password.", \
+            (bad, err)
+        assert fake.auth.sign_in_calls, "Supabase sign_in must be tried first"
+    finally:
+        auth._supabase_client = saved_client
+    print("PASS login no bcrypt bypass on Supabase credential rejection")
+
+
+def test_login_supabase_success_unchanged():
+    """FEAT-001: a Supabase-LINKED row whose Supabase sign_in SUCCEEDS logs in
+    unchanged, even when the local bcrypt hash is invalid (Supabase is the
+    authority on the happy path)."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    fake = _FakeSupabaseClient()  # sign_in_with_password succeeds
+    auth._supabase_client = lambda service=False: fake
+    try:
+        st = Store("sqlite:///:memory:")
+        uid = st.create_user("linked", "not-a-valid-bcrypt-hash",
+                             email="linked@example.com")
+        st.set_supabase_id(uid, "sb-linked")
+
+        ok, err = auth.authenticate_user(st, "linked", "any-pw-here")
+        assert err is None and ok["id"] == uid, (ok, err)
+        assert fake.auth.sign_in_calls, "Supabase sign_in must be called"
+    finally:
+        auth._supabase_client = saved_client
+    print("PASS login Supabase success unchanged (linked row)")
+
+
+def test_link_supabase_endpoint():
+    """FEAT-002: POST /api/link-supabase. Register a bcrypt-only user (Supabase
+    unconfigured), then configure Supabase + stub sign_up success and link via
+    the SAME session with the correct password (200, email_bound True, row
+    linked). A wrong password -> 400 and the row stays NULL. No session -> 401.
+    """
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import app as flask_app
+    import auth
+
+    saved_client = auth._supabase_client
+    try:
+        # (1) Register + login a local-only user (Supabase unconfigured).
+        c = flask_app.app.test_client()
+        r = c.post("/api/register", json={"username": "linkme_ep",
+                                          "password": "pw12345678",
+                                          "email": "linkme_ep@example.com"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        row = flask_app.STORE.get_user_by_username("linkme_ep")
+        assert not row.get("supabase_user_id"), row
+        user_id = row["id"]
+
+        # (3) No session -> 401 (fresh client, no cookie).
+        fresh = flask_app.app.test_client()
+        r = fresh.post("/api/link-supabase", json={"password": "pw12345678"})
+        assert r.status_code == 401, r.get_data(as_text=True)
+
+        # Now configure Supabase + stub sign_up success.
+        os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+        os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+        fake = _FakeSupabaseClient(sign_up_uid="sb-9")
+        auth._supabase_client = lambda service=False: fake
+
+        # (2b) Wrong password -> 400 and the row stays NULL.
+        r = c.post("/api/link-supabase", json={"password": "wrong-pw-1"})
+        assert r.status_code == 400, r.get_data(as_text=True)
+        assert not flask_app.STORE.get_auth_row_by_id(
+            user_id).get("supabase_user_id")
+
+        # (2a) Correct password (same session) -> 200, linked, email_bound True.
+        r = c.post("/api/link-supabase", json={"password": "pw12345678"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+        body = r.get_json()
+        assert body["ok"] is True and body["email_bound"] is True, body
+        assert flask_app.STORE.get_auth_row_by_id(
+            user_id)["supabase_user_id"] == "sb-9"
+    finally:
+        auth._supabase_client = saved_client
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS /api/link-supabase: 401 no session, 400 wrong pw, 200 links row")
+
+
+class _FakeSupabaseExistingUser:
+    """A pre-seeded Supabase admin user with .id and .email (what
+    admin.list_users returns)."""
+
+    def __init__(self, uid, email):
+        self.id = uid
+        self.email = email
+
+
+def test_link_resolves_existing_supabase_user():
+    """FEAT-002 (task-supabase-auth-hardening): link_supabase_account RESOLVES
+    an already-existing Supabase user for the row's stored email (matched
+    case-insensitively) and links the local row to that existing id WITHOUT
+    calling sign_up."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    try:
+        st = Store("sqlite:///:memory:")
+        uid = st.create_user("linkres", auth.hash_password("pw12345678"),
+                             email="LinkRes@Example.com")
+        assert not st.get_auth_row_by_id(uid).get("supabase_user_id")
+
+        # Supabase + service key configured so admin resolution runs.
+        os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+        os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+        os.environ["SUPABASE_SERVICE_KEY"] = "service-stub-key"
+        # Seed an existing Supabase user whose email matches the row's stored
+        # email but with a DIFFERENT case (proves case-insensitive matching).
+        fake = _FakeSupabaseClient(
+            sign_up_uid="sb-should-not-be-used",
+            admin_users=[_FakeSupabaseExistingUser(
+                "sb-existing", "linkres@example.COM")])
+        auth._supabase_client = lambda service=False: fake
+
+        ok, err, bound = auth.link_supabase_account(st, uid, "pw12345678")
+        assert ok is True and err is None and bound is True, (ok, err, bound)
+        assert st.get_auth_row_by_id(uid)["supabase_user_id"] == "sb-existing"
+        # sign_up must NOT have been called; admin lookup must have run.
+        assert fake.auth.sign_up_calls == [], fake.auth.sign_up_calls
+        assert fake.auth.admin.list_users_calls, "admin lookup must run"
+    finally:
+        auth._supabase_client = saved_client
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS link resolves existing Supabase user (case-insensitive), "
+          "links WITHOUT sign_up")
+
+
+def test_link_falls_back_to_signup_when_no_existing():
+    """FEAT-002: when admin.list_users returns no match, link_supabase_account
+    falls back to the existing sign_up path and links the row to the sign_up
+    uid."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    try:
+        st = Store("sqlite:///:memory:")
+        uid = st.create_user("linkfb", auth.hash_password("pw12345678"),
+                             email="linkfb@example.com")
+
+        os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+        os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+        os.environ["SUPABASE_SERVICE_KEY"] = "service-stub-key"
+        # Admin returns NO users (empty) -> definitively not found -> sign_up.
+        fake = _FakeSupabaseClient(sign_up_uid="sb-new", admin_users=[])
+        auth._supabase_client = lambda service=False: fake
+
+        ok, err, bound = auth.link_supabase_account(st, uid, "pw12345678")
+        assert ok is True and err is None and bound is True, (ok, err, bound)
+        assert st.get_auth_row_by_id(uid)["supabase_user_id"] == "sb-new"
+        # admin lookup ran AND sign_up was invoked on fallback.
+        assert fake.auth.admin.list_users_calls, "admin lookup must run"
+        assert len(fake.auth.sign_up_calls) == 1, fake.auth.sign_up_calls
+    finally:
+        auth._supabase_client = saved_client
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS link falls back to sign_up when no existing Supabase user")
+
+
+def test_link_bcrypt_reverify_still_gates():
+    """FEAT-002: a WRONG resent password gates the whole flow -> error, NO admin
+    lookup, NO sign_up, and the row's supabase_user_id stays NULL."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    try:
+        st = Store("sqlite:///:memory:")
+        uid = st.create_user("linkgate", auth.hash_password("correct-pw-123"),
+                             email="linkgate@example.com")
+
+        os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+        os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+        os.environ["SUPABASE_SERVICE_KEY"] = "service-stub-key"
+        fake = _FakeSupabaseClient(
+            sign_up_uid="sb-nope",
+            admin_users=[_FakeSupabaseExistingUser(
+                "sb-existing", "linkgate@example.com")])
+        auth._supabase_client = lambda service=False: fake
+
+        ok, err, bound = auth.link_supabase_account(st, uid, "wrong-pw-000")
+        assert ok is False and err == "Incorrect password." and bound is False, \
+            (ok, err, bound)
+        # Neither the admin lookup nor sign_up may have run; row stays NULL.
+        assert fake.auth.admin.list_users_calls == [], \
+            fake.auth.admin.list_users_calls
+        assert fake.auth.sign_up_calls == [], fake.auth.sign_up_calls
+        assert not st.get_auth_row_by_id(uid).get("supabase_user_id")
+    finally:
+        auth._supabase_client = saved_client
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS link bcrypt re-verify gates: no admin lookup, no sign_up, "
+          "row stays NULL on wrong password")
+
+
+def test_link_falls_back_when_admin_unavailable():
+    """FEAT-002: with SUPABASE_SERVICE_KEY UNSET (supabase_admin_configured()
+    False) the admin resolution is skipped and link_supabase_account falls back
+    to sign_up."""
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import auth
+    from storage import Store
+
+    saved_client = auth._supabase_client
+    try:
+        st = Store("sqlite:///:memory:")
+        uid = st.create_user("linknoadmin", auth.hash_password("pw12345678"),
+                             email="linknoadmin@example.com")
+
+        # Anon configured but NO service key -> admin unavailable.
+        os.environ["SUPABASE_URL"] = "https://stub.supabase.co"
+        os.environ["SUPABASE_ANON_KEY"] = "anon-stub-key"
+        os.environ.pop("SUPABASE_SERVICE_KEY", None)
+        assert auth.supabase_admin_configured() is False
+        # Seed an existing user that WOULD match -- proving it is NOT consulted
+        # because the admin lookup is skipped entirely.
+        fake = _FakeSupabaseClient(
+            sign_up_uid="sb-new2",
+            admin_users=[_FakeSupabaseExistingUser(
+                "sb-existing", "linknoadmin@example.com")])
+        auth._supabase_client = lambda service=False: fake
+
+        ok, err, bound = auth.link_supabase_account(st, uid, "pw12345678")
+        assert ok is True and err is None and bound is True, (ok, err, bound)
+        assert st.get_auth_row_by_id(uid)["supabase_user_id"] == "sb-new2"
+        # admin lookup must have been skipped; sign_up invoked.
+        assert fake.auth.admin.list_users_calls == [], \
+            fake.auth.admin.list_users_calls
+        assert len(fake.auth.sign_up_calls) == 1, fake.auth.sign_up_calls
+    finally:
+        auth._supabase_client = saved_client
+        for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+            os.environ.pop(k, None)
+    print("PASS link falls back to sign_up when admin unavailable (no service "
+          "key)")
 
 
 def test_syzygy_setoption_command_sequence():
@@ -2975,6 +3527,25 @@ def main():
     test_validate_email_and_email_required_at_signup()
     test_storage_supabase_and_fide_id_columns()
     test_forgot_password_noop_without_supabase()
+    # FEAT-002 (supabase-decouple-signup): email decoupled from account
+    # creation, per-user login routing, /api/register outcome flags, and the
+    # additive POST /api/link-supabase retry endpoint (Supabase stubbed).
+    test_register_supabase_signup_failure_falls_back_to_local()
+    test_register_supabase_signup_success_links()
+    test_authenticate_routes_per_user()
+    # FEAT-001 (task-supabase-auth-hardening): bcrypt fallback at login only on
+    # Supabase UNAVAILABILITY, never on a definitive credential rejection.
+    test_login_bcrypt_fallback_on_supabase_unavailable()
+    test_login_no_bcrypt_bypass_on_credential_rejection()
+    test_login_supabase_success_unchanged()
+    test_link_supabase_endpoint()
+    # FEAT-002 (task-supabase-auth-hardening): resolve-then-link retry in
+    # link_supabase_account (resolve an existing Supabase user by email via the
+    # service-role admin client before falling back to sign_up).
+    test_link_resolves_existing_supabase_user()
+    test_link_falls_back_to_signup_when_no_existing()
+    test_link_bcrypt_reverify_still_gates()
+    test_link_falls_back_when_admin_unavailable()
     # FEAT-005: Syzygy setoption/download, Polyglot book, custom position.
     test_syzygy_setoption_command_sequence()
     test_syzygy_download_disabled_is_noop()

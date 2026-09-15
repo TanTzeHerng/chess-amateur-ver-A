@@ -634,16 +634,43 @@ class Store:
             return None
 
     def get_user_by_username(self, username):
-        """Return (id, username, password_hash, email) or None (exact-match)."""
+        """Return (id, username, password_hash, email, supabase_user_id) or None
+        (exact-match).
+
+        supabase_user_id is additive (nullable) so per-user login routing and
+        the link endpoint can decide whether a row authenticates via Supabase
+        (non-empty) or bcrypt (NULL). The returned dict is a strict SUPERSET of
+        the previous shape (id, username, password_hash, email), so existing
+        callers are unaffected."""
         ph = self._placeholder()
         row = self._execute(
-            "SELECT id, username, password_hash, email FROM users"
-            " WHERE username = %s" % ph,
+            "SELECT id, username, password_hash, email, supabase_user_id"
+            " FROM users WHERE username = %s" % ph,
             (username,), fetch="one")
         if not row:
             return None
         return {"id": row[0], "username": row[1], "password_hash": row[2],
-                "email": row[3]}
+                "email": row[3], "supabase_user_id": row[4]}
+
+    def get_auth_row_by_id(self, user_id):
+        """Return {id, username, password_hash, email, supabase_user_id} for the
+        given user id, or None.
+
+        Unlike get_user_by_id (which returns rating fields but neither the
+        password hash nor the Supabase link), this returns exactly what the
+        link-Supabase flow needs: the stored bcrypt hash (to verify the resent
+        password), the email (to register with Supabase), and the current
+        supabase_user_id (to detect an already-linked row). Works on both
+        Postgres and SQLite."""
+        ph = self._placeholder()
+        row = self._execute(
+            "SELECT id, username, password_hash, email, supabase_user_id"
+            " FROM users WHERE id = %s" % ph,
+            (user_id,), fetch="one")
+        if not row:
+            return None
+        return {"id": row[0], "username": row[1], "password_hash": row[2],
+                "email": row[3], "supabase_user_id": row[4]}
 
     def username_exists_ci(self, username):
         """Return True if a user with this username exists, comparing

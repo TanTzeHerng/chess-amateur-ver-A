@@ -170,56 +170,143 @@ def _derive_email(username, email):
 
 
 def _register_supabase(store, username, password, email):
-    """Signup path when Supabase is configured: create the Supabase auth user,
-    then create + link the local users row. Returns (user_dict, error)."""
-    client = _supabase_client()
-    if client is None:  # pragma: no cover - only when misconfigured at runtime
-        return None, "Accounts are unavailable right now."
+    """Signup path when Supabase is configured.
+
+    Email is DECOUPLED from the blocking account-creation path: the local
+    bcrypt-backed users row is ALWAYS created whenever the username is free,
+    and the Supabase sign_up (which sends the confirmation / password-reset
+    email) is attempted best-effort. Returns (user_dict, error, supabase_ok)
+    where supabase_ok is:
+      * True  -> sign_up succeeded and the row was linked (email-bound).
+      * False -> sign_up (or client init) FAILED; the row was created UNLINKED
+                 via the bcrypt fallback and the real failure was LOGGED.
+    On a username race/collision returns (None, error, None). Never raises.
+    """
     # Prefer the REAL email the user supplied so Supabase confirmation /
     # reset emails reach them; fall back to the synthesized placeholder only
     # if it is somehow absent (register_user requires it for real signups).
     reg_email = _derive_email(username, email)
-    try:
-        res = client.auth.sign_up({"email": reg_email,
-                                   "password": password})
-    except Exception as exc:  # pragma: no cover - network/dupe-email errors
-        return None, "Could not create account: %s" % _short(exc)
-    sb_user = getattr(res, "user", None)
-    sb_uid = getattr(sb_user, "id", None) if sb_user is not None else None
-    # Create the linked LOCAL row. We still store a bcrypt hash so the local
-    # row is self-consistent, but Supabase is the credential authority here.
+    # Create the LOCAL row FIRST so account creation never depends on the
+    # Supabase outcome. We store a bcrypt hash so the row is self-consistent
+    # and usable even if the email step fails (bcrypt fallback login).
     ph = hash_password(password)
     uid = store.create_user(username, ph, email=reg_email)
     if uid is None:
-        # Local username race/collision: treat as taken (Supabase user may have
-        # been created; that is acceptable and can be reclaimed on retry).
-        return None, "That username is already taken."
+        # Local username race/collision: treat as taken. No Supabase attempt.
+        return None, "That username is already taken.", None
+    # Best-effort Supabase sign_up: NEVER aborts account creation. A rate
+    # limit, SMTP failure, unavailable client, or any other error simply
+    # leaves the row unlinked (bcrypt fallback) and reports supabase_ok False.
+    client = _supabase_client()
+    if client is None:
+        _log.error("Supabase sign_up skipped for %r: client unavailable; "
+                   "account created UNLINKED (bcrypt fallback)", username)
+        return {"id": uid, "username": username}, None, False
+    try:
+        res = client.auth.sign_up({"email": reg_email,
+                                   "password": password})
+    except Exception as exc:
+        _log.error("Supabase sign_up failed for %r: %s; account created "
+                   "UNLINKED (bcrypt fallback)", username, _short(exc))
+        return {"id": uid, "username": username}, None, False
+    sb_user = getattr(res, "user", None)
+    sb_uid = getattr(sb_user, "id", None) if sb_user is not None else None
     if sb_uid and hasattr(store, "set_supabase_id"):
         store.set_supabase_id(uid, sb_uid)
-    return {"id": uid, "username": username}, None
+        return {"id": uid, "username": username}, None, True
+    # sign_up returned no usable user id: treat as a Supabase failure but keep
+    # the (already created) local bcrypt account.
+    _log.error("Supabase sign_up for %r returned no user id; account created "
+               "UNLINKED (bcrypt fallback)", username)
+    return {"id": uid, "username": username}, None, False
 
 
-def _authenticate_supabase(store, username, password):
-    """Login path when Supabase is configured: authenticate via Supabase, then
-    resolve the local users row. Returns (user_dict, error)."""
+# Supabase auth attempt outcomes, distinguishing a definitive credential
+# rejection (do NOT fall back to bcrypt) from a transient outage (fall back).
+_SB_AUTHENTICATED = "authenticated"
+_SB_REJECTED = "rejected"
+_SB_UNAVAILABLE = "unavailable"
+
+try:  # httpx is a hard dependency of supabase; import defensively regardless.
+    import httpx as _httpx
+except Exception:  # pragma: no cover - httpx should always be present
+    _httpx = None
+
+# Raw httpx transport exception class NAMES that mean "Supabase unreachable".
+# gotrue/supabase_auth normally wrap these into AuthRetryableError, but we also
+# match them directly in case a transport error ever escapes unwrapped.
+_HTTPX_TRANSPORT_NAMES = frozenset({
+    "ConnectError", "ConnectTimeout", "ReadTimeout", "WriteTimeout",
+    "PoolTimeout", "TimeoutException", "NetworkError", "RemoteProtocolError",
+    "TransportError",
+})
+
+
+def _classify_supabase_auth_error(exc):
+    """Classify a sign_in_with_password exception as 'unavailable' or
+    'rejected'.
+
+    Rules:
+      (a) UNAVAILABLE iff the exception (or any class in its type().__mro__) is
+          named 'AuthRetryableError' -- gotrue/supabase_auth normalizes httpx
+          transport errors into AuthRetryableError(status 0) and HTTP
+          502/503/504 into AuthRetryableError -- OR the exception is a raw httpx
+          transport error (ConnectError/ConnectTimeout/ReadTimeout/... ) in
+          case a transport error ever escapes unwrapped.
+      (b) REJECTED for everything else (AuthApiError, AuthInvalidCredentialsError,
+          AuthUnknownError, and any other Exception).
+
+    We match by CLASS NAME across the MRO rather than a single hard
+    import-identity because `gotrue` and `supabase_auth` are DISTINCT packages
+    in this venv whose exception classes are NOT identical objects; matching by
+    name is robust whether the runtime raises gotrue.* or supabase_auth.* types.
+
+    Conservative default: anything not CLEARLY retryable/transport maps to
+    REJECTED so a genuine wrong-password is never salvaged by an old local
+    bcrypt hash (no bcrypt bypass).
+    """
+    mro_names = {c.__name__ for c in type(exc).__mro__}
+    if "AuthRetryableError" in mro_names:
+        return _SB_UNAVAILABLE
+    if _httpx is not None and isinstance(exc, _httpx.HTTPError):
+        # Raw httpx transport errors (connect/read/timeout/network) mean the
+        # backend was unreachable. An HTTPStatusError (a real HTTP response)
+        # is NOT a transport failure, so it stays REJECTED by default.
+        if mro_names & _HTTPX_TRANSPORT_NAMES:
+            return _SB_UNAVAILABLE
+    return _SB_REJECTED
+
+
+def _authenticate_supabase(local, password):
+    """Authenticate an already-resolved local row via Supabase.
+
+    Used for rows that carry a non-empty supabase_user_id (email-bound). The
+    local row is resolved by the caller so this routes PER-USER rather than on
+    the global supabase_configured() flag.
+
+    Returns a 3-tuple (user_dict, error, outcome) where outcome is one of
+    'authenticated' | 'rejected' | 'unavailable' so the caller can decide
+    whether a bcrypt fallback is appropriate:
+      * client is None                 -> ('...', None, 'unavailable')
+      * sign_in succeeds               -> (user_dict, None, 'authenticated')
+      * sign_in raises, classified     -> (None, generic, 'rejected'|'unavailable')
+    The user-facing error stays the uniform generic string in all failure
+    cases. Never raises."""
     generic = "Incorrect username or password."
-    # Resolve the local row first so we know which email to authenticate.
-    local = store.get_user_by_username(username)
-    if local is None:
-        return None, generic
     client = _supabase_client()
-    if client is None:  # pragma: no cover - misconfigured at runtime
-        return None, "Accounts are unavailable right now."
+    if client is None:
+        return None, generic, _SB_UNAVAILABLE
     # Authenticate against the REAL email stored on the local row at signup;
     # fall back to the synthesized placeholder only for legacy rows without a
     # stored email.
-    login_email = _derive_email(username, local.get("email"))
+    login_email = _derive_email(local["username"], local.get("email"))
     try:
         client.auth.sign_in_with_password(
             {"email": login_email, "password": password})
-    except Exception:  # pragma: no cover - wrong creds / network
-        return None, generic
-    return {"id": local["id"], "username": local["username"]}, None
+    except Exception as exc:  # pragma: no cover - wrong creds / network
+        outcome = _classify_supabase_auth_error(exc)
+        return None, generic, outcome
+    return {"id": local["id"], "username": local["username"]}, None, _SB_AUTHENTICATED
 
 
 def _short(exc):
@@ -284,32 +371,44 @@ def delete_supabase_user(supabase_user_id):
 
 
 def register_user(store, username, password, email=None):
-    """Validate + create a user. Returns (user_dict, None) on success or
-    (None, error_message) on failure.
+    """Validate + create a user. Returns a 3-tuple (user_dict, error,
+    supabase_ok).
 
-    Routes through Supabase Auth when configured (SUPABASE_URL +
-    SUPABASE_ANON_KEY), else the original bcrypt-local path. In BOTH paths the
-    local users.username UNIQUE constraint is the duplicate-username guard.
+    On any validation / duplicate-username failure returns (None, error, None).
+    On success user_dict is set, error is None, and supabase_ok signals the
+    Supabase email outcome:
+      * True  -> Supabase was configured AND sign_up succeeded AND the row was
+                 linked (the account is email-bound).
+      * False -> Supabase was configured but sign_up (or the client) FAILED, so
+                 we fell back to a bcrypt-local row (created UNLINKED; the real
+                 failure was LOGGED).
+      * None  -> Supabase was NOT configured (pure bcrypt-local mode).
+
+    The Supabase email step is DECOUPLED from account creation: whenever the
+    username/password/email validate and the username is free, the local row is
+    ALWAYS created regardless of the Supabase outcome, and the email is stored
+    on that row either way. In BOTH paths the local users.username UNIQUE
+    constraint is the duplicate-username guard. Never raises.
 
     Requires an enabled Store (a configured database). Callers must handle the
     guest-only case (store.enabled == False) before calling.
     """
     if not store or not store.enabled:
-        return None, "Accounts are unavailable right now."
+        return None, "Accounts are unavailable right now.", None
     username = (username or "").strip()
     err = validate_username(username)
     if err:
-        return None, err
+        return None, err, None
     err = validate_password(password)
     if err:
-        return None, err
+        return None, err, None
     # A REAL email is required at signup so Supabase confirmation / password-
     # reset emails reach the user. Validated in BOTH the Supabase and bcrypt-
     # local paths; the normalized (stripped) address is stored on the local row.
     email = (email or "").strip()
     err = validate_email(email)
     if err:
-        return None, err
+        return None, err, None
     # Case-insensitive uniqueness is friendlier: reject a new username that
     # collides with an existing one ignoring case (e.g. 'Alice' vs 'alice').
     # This is a pre-check for a clear error message; the DB UNIQUE constraint
@@ -322,7 +421,7 @@ def register_user(store, username, password, email=None):
     else:  # pragma: no cover - defensive for older stores
         exists = store.get_user_by_username(username) is not None
     if exists:
-        return None, "That username is already taken."
+        return None, "That username is already taken.", None
 
     if supabase_configured():
         return _register_supabase(store, username, password, email)
@@ -332,8 +431,8 @@ def register_user(store, username, password, email=None):
     uid = store.create_user(username, ph, email=email)
     if uid is None:
         # Lost a race (or other insert failure): treat as taken.
-        return None, "That username is already taken."
-    return {"id": uid, "username": username}, None
+        return None, "That username is already taken.", None
+    return {"id": uid, "username": username}, None, None
 
 
 def authenticate_user(store, username, password):
@@ -348,15 +447,135 @@ def authenticate_user(store, username, password):
     username = (username or "").strip()
     generic = "Incorrect username or password."
 
-    if supabase_configured():
-        return _authenticate_supabase(store, username, password)
-
-    # --- bcrypt-local fallback ---
+    # PER-USER routing (not the global supabase_configured() flag): resolve the
+    # local row, then route on whether IT is Supabase-linked. This keeps BOTH
+    # kinds of existing account working -- a Supabase/email-bound row (non-empty
+    # supabase_user_id) authenticates via Supabase, and a bcrypt-only row (NULL
+    # supabase_user_id, e.g. one created via the decoupled email fallback)
+    # authenticates via bcrypt -- regardless of the server-wide flag.
     user = store.get_user_by_username(username)
     if user is None:
         # Still run a hash to reduce user-enumeration timing differences.
         verify_password(password or "", "$2b$12$" + "x" * 53)
         return None, generic
+    if user.get("supabase_user_id"):
+        # Try Supabase FIRST for a linked row, then classify the outcome:
+        #   * authenticated -> logged in.
+        #   * rejected      -> definitive wrong-credentials; return the generic
+        #     error and do NOT fall back (a wrong Supabase password must never
+        #     be salvaged by an old local bcrypt hash -> no bypass).
+        #   * unavailable   -> Supabase outage/unreachable; fall back to the
+        #     row's local bcrypt hash so an outage does not lock the user out.
+        sb_user, sb_err, outcome = _authenticate_supabase(user, password)
+        if outcome == _SB_AUTHENTICATED:
+            return sb_user, None
+        if outcome == _SB_UNAVAILABLE:
+            if verify_password(password or "", user["password_hash"]):
+                return {"id": user["id"], "username": user["username"]}, None
+            return None, generic
+        # _SB_REJECTED (or any unknown outcome): uniform generic, no fallback.
+        return None, generic
+
+    # --- bcrypt-local (row not linked to Supabase) ---
     if not verify_password(password or "", user["password_hash"]):
         return None, generic
     return {"id": user["id"], "username": user["username"]}, None
+
+
+def _find_supabase_user_id_by_email(email):
+    """Resolve whether a Supabase user already EXISTS for ``email``.
+
+    Returns a (user_id|None, resolved_ok) tuple:
+      * (found_id, True)  -> a matching Supabase user exists.
+      * (None, True)      -> definitively no matching user (admin lookup ran
+                             successfully and found nothing).
+      * (None, False)     -> admin is unavailable / misconfigured, or the
+                             lookup errored; the caller should fall back to
+                             sign_up.
+
+    supabase 2.31.0 has NO get-by-email, so we page through
+    ``client.auth.admin.list_users(page, per_page)`` (returns List[User] with
+    ``.id`` / ``.email``) and match the email case-insensitively. Never raises.
+    """
+    if not supabase_admin_configured():
+        return None, False
+    client = _supabase_client(service=True)
+    if client is None:
+        return None, False
+    target = (email or "").strip().casefold()
+    per_page = 200
+    max_pages = 50
+    try:
+        for page in range(1, max_pages + 1):
+            users = client.auth.admin.list_users(page=page, per_page=per_page)
+            users = users or []
+            for u in users:
+                u_email = (getattr(u, "email", None) or "").strip().casefold()
+                if u_email and u_email == target:
+                    return getattr(u, "id", None), True
+            # Stop when the page is not full (last page reached).
+            if len(users) < per_page:
+                break
+    except Exception as exc:  # pragma: no cover - admin/network issue is non-fatal
+        _log.error("Supabase admin list_users lookup failed: %s", _short(exc))
+        return None, False
+    return None, True
+
+
+def link_supabase_account(store, user_id, password):
+    """Best-effort retry that binds an existing (bcrypt-local) account to
+    Supabase / email. Returns (ok, error, email_bound). Never raises.
+
+    The client RESENDS the signup password; the server FIRST verifies it against
+    the stored bcrypt hash so an arbitrary password can NOT be set on the
+    Supabase side. It then RESOLVES whether a Supabase user already exists for
+    the stored email (via the service-role admin client) and links the row to
+    that existing id when found; only if no existing user is found (or the admin
+    lookup is unavailable / errors) does it fall back to calling Supabase
+    sign_up and link the row on success.
+
+    SECURITY: linking to an already-existing Supabase user by email is
+    acceptable ONLY because the caller has already proven ownership of the local
+    account -- the session guard in app.py plus the bcrypt re-verify of the
+    resent password below. Do NOT add any unauthenticated resolve path or new
+    endpoint on top of this helper.
+    """
+    if not store or not store.enabled:
+        return False, "Accounts are unavailable right now.", False
+    row = store.get_auth_row_by_id(user_id)
+    if row is None:
+        return False, "Account not found.", False
+    # Already linked -> idempotent no-op success.
+    if row.get("supabase_user_id"):
+        return True, None, True
+    # Verify the RESENT password against the stored bcrypt hash so a caller
+    # cannot set an arbitrary Supabase password for the account.
+    if not verify_password(password or "", row.get("password_hash")):
+        return False, "Incorrect password.", False
+    if not supabase_configured():
+        return False, "Supabase is not configured on this server.", False
+    reg_email = _derive_email(row["username"], row.get("email"))
+    # First, try to RESOLVE an already-existing Supabase user for this email and
+    # link to it instead of blindly re-registering (a prior half-completed
+    # sign_up would otherwise fail with "email already registered" / rate-limit).
+    uid_found, _resolved_ok = _find_supabase_user_id_by_email(reg_email)
+    if uid_found and hasattr(store, "set_supabase_id"):
+        store.set_supabase_id(user_id, uid_found)
+        return True, None, True
+    # No existing user found (or admin lookup unavailable/errored): fall back to
+    # the original best-effort sign_up path.
+    client = _supabase_client()
+    if client is None:
+        return False, "Accounts are unavailable right now.", False
+    try:
+        res = client.auth.sign_up({"email": reg_email, "password": password})
+    except Exception as exc:
+        _log.error("Supabase link sign_up failed for user %s: %s",
+                   user_id, _short(exc))
+        return False, "Could not link account: %s" % _short(exc), False
+    sb_user = getattr(res, "user", None)
+    sb_uid = getattr(sb_user, "id", None) if sb_user is not None else None
+    if sb_uid and hasattr(store, "set_supabase_id"):
+        store.set_supabase_id(user_id, sb_uid)
+        return True, None, True
+    return False, "Could not link account.", False
