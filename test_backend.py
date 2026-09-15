@@ -1215,6 +1215,83 @@ def test_register_full_flow_with_fide_id_bcrypt_path():
     print("PASS /api/register with FIDE ID (bcrypt path) seeds ratings, no network")
 
 
+def test_register_fide_id_diagnostic_logging():
+    """Diagnostics: POST /api/register must emit VISIBLE, unambiguous log lines
+    that distinguish (a) an accepted numeric fide_id -> seeding entered ->
+    scraper called, (b) a non-digit fide_id -> rejected, seeding skipped, and
+    (c) no fide_id key -> a clear "no fide_id" line. We capture app.logger via
+    an attached handler (no pytest/caplog in this suite) and stub the scraper so
+    NO network is used. This locates exactly where a submitted FIDE ID is
+    dropped before the fetch.
+    """
+    import logging
+    import io
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+    os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
+    for k in ("SUPABASE_URL", "SUPABASE_ANON_KEY", "SUPABASE_SERVICE_KEY"):
+        os.environ.pop(k, None)
+    import app as flask_app
+    import fide as fide_mod
+
+    # Capture everything app.logger emits during the three registrations.
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.INFO)
+    flask_app.app.logger.addHandler(handler)
+    flask_app.app.logger.setLevel(logging.INFO)
+
+    # Stub the network fetcher so an accepted id reaches (a stubbed) scrape.
+    saved = fide_mod.fetch_profile_html
+    scraper_calls = []
+
+    def fake_fetch(fid, timeout=8):
+        scraper_calls.append(fid)
+        return ('<div class="profile-standart"><span>1990</span></div>'
+                '<div class="profile-rapid"><span>1850</span></div>'
+                '<div class="profile-blitz"><span>1750</span></div>')
+
+    fide_mod.fetch_profile_html = fake_fetch
+    try:
+        c = flask_app.app.test_client()
+
+        # (a) Clean numeric fide_id -> accepted, seeding entered, scraper hit.
+        r = c.post("/api/register", json={"username": "diaguser_a",
+                                          "password": "pw12345678",
+                                          "email": "diaga@example.com",
+                                          "fide_id": "35827300"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+
+        # (b) Non-digit fide_id -> rejected, seeding skipped.
+        r = c.post("/api/register", json={"username": "diaguser_b",
+                                          "password": "pw12345678",
+                                          "email": "diagb@example.com",
+                                          "fide_id": "abc123"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+
+        # (c) No fide_id key at all.
+        r = c.post("/api/register", json={"username": "diaguser_c",
+                                          "password": "pw12345678",
+                                          "email": "diagc@example.com"})
+        assert r.status_code == 200, r.get_data(as_text=True)
+    finally:
+        fide_mod.fetch_profile_html = saved
+        flask_app.app.logger.removeHandler(handler)
+
+    logs = buf.getvalue()
+
+    # (a) accepted -> seeding entered -> scraper actually called.
+    assert "raw fide_id='35827300' -> cleaned='35827300' (accepted)" in logs, logs
+    assert "seeding FIDE for user=" in logs, logs
+    assert "35827300" in "".join(scraper_calls), scraper_calls
+    assert "seeded=" in logs, logs
+    # (b) rejected -> seeding skipped, clear "rejected" line.
+    assert "raw fide_id='abc123' -> cleaned=None (rejected" in logs, logs
+    # (c) no key -> clear "no fide_id" line.
+    assert "register: no fide_id key in request body" in logs, logs
+    print("PASS /api/register emits diagnostic log lines for accepted / "
+          "rejected / absent fide_id")
+
+
 def test_bcrypt_fallback_when_supabase_unconfigured():
     """FEAT-004: with SUPABASE_URL/ANON_KEY unset, register + login work via
     the bcrypt path and duplicate usernames (exact + case-insensitive) are
@@ -2893,6 +2970,7 @@ def main():
     test_fide_lookup_ratings_never_raises_and_injects_fetcher()
     test_signup_fide_seeding_maps_and_defaults()
     test_register_full_flow_with_fide_id_bcrypt_path()
+    test_register_fide_id_diagnostic_logging()
     test_bcrypt_fallback_when_supabase_unconfigured()
     test_validate_email_and_email_required_at_signup()
     test_storage_supabase_and_fide_id_columns()

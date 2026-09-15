@@ -28,6 +28,7 @@ Environment:
   PORT          port to bind (default 8000).
 """
 import datetime
+import logging
 import os
 import secrets
 
@@ -59,6 +60,27 @@ FIDE_DEFAULT_RATING = 1400
 CURRENT_DEMO_VERSION = 1
 
 app = Flask(__name__)
+
+# Make module-level loggers (fide.py / auth.py use logging.getLogger(__name__))
+# actually reach stdout under gunicorn on Render. Without any root logging
+# configuration those INFO/WARNING records are dropped, which is why the
+# "FIDE fetch ..." / "parsed ratings=..." lines never showed up in the deploy
+# logs even though the code that emits them may have run. We attach a single
+# StreamHandler to the root logger at INFO exactly once (guarded so repeated
+# imports / multiple gunicorn workers do not stack duplicate handlers, and so
+# we do not clobber a handler an operator/gunicorn already installed). This is
+# diagnostics only: it changes NO seeding/auth behavior.
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+else:  # a handler already exists (e.g. gunicorn) -- just ensure INFO passes
+    logging.getLogger().setLevel(
+        min(logging.getLogger().level or logging.INFO, logging.INFO))
+# Belt-and-suspenders: make sure the fide module logger emits at INFO and
+# propagates to the root handler above, regardless of root level juggling.
+logging.getLogger("fide").setLevel(logging.INFO)
 
 _secret = os.environ.get("SECRET_KEY")
 if not _secret:
@@ -204,6 +226,11 @@ def _seed_fide_ratings(user_id, fide_id, scraper=fide.lookup_ratings):
 
     Returns the seeded {classical, rapid, blitz} dict actually written.
     """
+    # Diagnostics (app.logger is reliably visible under gunicorn on Render):
+    # announce that seeding was ENTERED so we can distinguish "reached the
+    # scraper" from "skipped before it". No sensitive data -- a FIDE ID is
+    # public.
+    app.logger.info("seeding FIDE for user=%s id=%s", user_id, fide_id)
     if fide_id:
         STORE.set_fide_id(user_id, fide_id)
     ratings = {"classical": None, "rapid": None, "blitz": None}
@@ -211,7 +238,15 @@ def _seed_fide_ratings(user_id, fide_id, scraper=fide.lookup_ratings):
         try:
             scraped = scraper(fide_id) or {}
         except Exception:
+            # Log the ACTUAL exception + traceback rather than swallowing it,
+            # so a scrape failure is diagnosable instead of silently yielding
+            # all-1400. Still non-blocking: signup proceeds with defaults.
+            app.logger.exception(
+                "seeding FIDE for user=%s id=%s: scraper raised", user_id,
+                fide_id)
             scraped = {}
+        app.logger.info("seeding FIDE for user=%s id=%s: scraped=%s",
+                        user_id, fide_id, scraped)
         for k in ratings:
             ratings[k] = scraped.get(k)
     seeded = {}
@@ -220,6 +255,8 @@ def _seed_fide_ratings(user_id, fide_id, scraper=fide.lookup_ratings):
         rating = value if value is not None else FIDE_DEFAULT_RATING
         seeded[tclass] = rating
         STORE.update_fide_rating(user_id, tclass, rating)
+    app.logger.info("seeding FIDE for user=%s id=%s: seeded=%s",
+                    user_id, fide_id, seeded)
     return seeded
 
 
@@ -315,12 +352,32 @@ def api_register():
         app.logger.warning("Failed to set demo_pending for user %s", user["id"])
     # Seed FIDE ratings from an optional FIDE ID (present -> scraped value,
     # absent/unrated -> 1400). Never blocks signup on a scrape failure.
-    fide_id = _clean_fide_id(data.get("fide_id"))
+    #
+    # Diagnostics: log the RAW submitted fide_id and the _clean_fide_id result
+    # so a deploy can tell three cases apart: (a) the client never sent the
+    # key, (b) it was sent but rejected as non-digit, (c) it was accepted. A
+    # FIDE ID is public data -- safe to log; we do NOT log username/password/
+    # email values. Emitted via app.logger (INFO), which is reliably visible in
+    # Render's gunicorn log stream.
+    _raw_fide_id = data.get("fide_id")
+    _has_fide_key = "fide_id" in data
+    fide_id = _clean_fide_id(_raw_fide_id)
+    if not _has_fide_key:
+        app.logger.info("register: no fide_id key in request body")
+    elif fide_id is None:
+        app.logger.info(
+            "register: raw fide_id=%r -> cleaned=None (rejected: not a digit "
+            "string), seeding skipped", _raw_fide_id)
+    else:
+        app.logger.info("register: raw fide_id=%r -> cleaned=%r (accepted)",
+                        _raw_fide_id, fide_id)
     if fide_id:
         try:
             _seed_fide_ratings(user["id"], fide_id)
         except Exception:  # pragma: no cover - defensive; seeding is best-effort
-            app.logger.warning("FIDE seeding failed for user %s", user["id"])
+            # Log the actual exception + traceback, not just a generic warning,
+            # so the failure point is visible. Still non-blocking.
+            app.logger.exception("FIDE seeding failed for user %s", user["id"])
     session.clear()
     session["uid"] = user["id"]
     return jsonify({"user": user})
