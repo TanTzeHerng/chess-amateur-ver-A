@@ -1061,6 +1061,85 @@ def test_fide_lookup_ratings_never_raises_and_injects_fetcher():
     print("PASS fide.lookup_ratings injectable fetcher + safe all-None fallbacks")
 
 
+def test_fide_parser_current_ratings_fide_com_layout():
+    """Regression for FIDE ID 35827300 ("Ng, Shu Heng"): the CURRENT
+    ratings.fide.com profile layout puts each rating in the FIRST <p> of a
+    'profile-<control> profile-game' block (the SECOND <p> is the label), after
+    an <img> that carries numeric attributes (height="25"). The rating must be
+    read from that first <p> -- NOT the first digit run (which would grab an img
+    attribute) and NOT the birth year (2011) that also appears on the page.
+    NO network. Ground truth: standard/classical=2019, rapid=1806, blitz=2018.
+    """
+    import fide
+    # Exact current-layout markup from a real profile page.
+    fixture = (
+        '<div class="profile-games ">\n'
+        '\t<div class="profile-standart profile-game ">\n'
+        '\t\t<img src="/img/logo_std.svg" alt="standart" height="25">\n'
+        '\t\t<p>2019</p><p style="font-size: 8px; padding:0; margin:0;">STANDARD '
+        '<span class="inactiv_note"></span></p>\t\t\t</div>\n'
+        '\t<div class="profile-rapid profile-game ">\n'
+        '\t\t<img src="/img/logo_rpd.svg" alt="rapid" height="25">\n'
+        '\t\t<p>1806</p><p style="font-size: 8px; padding:0; margin:0;">RAPID'
+        '<span class="inactiv_note"></span></p>\t\t\t</div>\n'
+        '\t<div class="profile-blitz profile-game ">\n'
+        '\t\t<img src="/img/logo_blitz.svg " alt="blitz" height="25">\n'
+        '\t\t<p>2018</p><p style="font-size: 8px; padding:0; margin:0;">BLITZ'
+        '<span class="inactiv_note"></span></p>\t\t\t</div>\n'
+        '\t<!--profile-games-->\n'
+        '</div>')
+    r = fide.parse_profile_html(fixture)
+    assert r == {"classical": 2019, "rapid": 1806, "blitz": 2018}, r
+
+    # Birth year 2011 elsewhere on the page must NOT be mistaken for a rating.
+    with_birth_year = '<div class="profile-info">Born 2011</div>' + fixture
+    r = fide.parse_profile_html(with_birth_year)
+    assert r == {"classical": 2019, "rapid": 1806, "blitz": 2018}, r
+
+    # Numeric img attributes (width/height) between the class and the rating
+    # <p> must NOT be grabbed instead of the real rating (this defeated the old
+    # first-digit-run parser).
+    hard = fixture.replace('height="25"', 'width="150" height="200"')
+    r = fide.parse_profile_html(hard)
+    assert r == {"classical": 2019, "rapid": 1806, "blitz": 2018}, r
+
+    # Unrated variant: rapid's first <p> is empty -> None for rapid ONLY, while
+    # standard and blitz still parse from their own first <p>.
+    unrated_rapid = (
+        '<div class="profile-standart profile-game "><p>2019</p>'
+        '<p>STANDARD</p></div>'
+        '<div class="profile-rapid profile-game "><p></p><p>RAPID</p></div>'
+        '<div class="profile-blitz profile-game "><p>2018</p><p>BLITZ</p></div>')
+    r = fide.parse_profile_html(unrated_rapid)
+    assert r == {"classical": 2019, "rapid": None, "blitz": 2018}, r
+
+    # Unrated variant: blitz's first <p> is "0" -> None for blitz only.
+    zero_blitz = (
+        '<div class="profile-standart profile-game "><p>2019</p>'
+        '<p>STANDARD</p></div>'
+        '<div class="profile-rapid profile-game "><p>1806</p><p>RAPID</p></div>'
+        '<div class="profile-blitz profile-game "><p>0</p><p>BLITZ</p></div>')
+    r = fide.parse_profile_html(zero_blitz)
+    assert r == {"classical": 2019, "rapid": 1806, "blitz": None}, r
+
+    # Absent control: blitz block missing entirely -> None for blitz only.
+    absent_blitz = (
+        '<div class="profile-standart profile-game "><p>2019</p>'
+        '<p>STANDARD</p></div>'
+        '<div class="profile-rapid profile-game "><p>1806</p><p>RAPID</p></div>')
+    r = fide.parse_profile_html(absent_blitz)
+    assert r == {"classical": 2019, "rapid": 1806, "blitz": None}, r
+
+    # lookup_ratings glue: fetcher returning the fixture yields the 3 ratings;
+    # fetcher returning None yields all-None (signup then falls back to 1400).
+    assert fide.lookup_ratings("35827300", fetcher=lambda fid: fixture) == {
+        "classical": 2019, "rapid": 1806, "blitz": 2018}
+    assert fide.lookup_ratings("35827300", fetcher=lambda fid: None) == {
+        "classical": None, "rapid": None, "blitz": None}
+    print("PASS fide.parse_profile_html reads current ratings.fide.com <p> layout "
+          "(id 35827300 -> 2019/1806/2018)")
+
+
 def test_signup_fide_seeding_maps_and_defaults():
     """FEAT-004: app._seed_fide_ratings seeds each FIDE time control to the
     scraped rating when present and 1400 when absent, using a STUBBED scraper
@@ -2810,6 +2889,7 @@ def main():
     test_flask_collections_endpoints_auth_and_ownership()
     # FEAT-004: Supabase-gated auth + FIDE ratings seeding at signup.
     test_fide_parser_extracts_ratings()
+    test_fide_parser_current_ratings_fide_com_layout()
     test_fide_lookup_ratings_never_raises_and_injects_fetcher()
     test_signup_fide_seeding_maps_and_defaults()
     test_register_full_flow_with_fide_id_bcrypt_path()

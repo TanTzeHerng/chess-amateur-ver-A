@@ -27,10 +27,16 @@ profile layouts over the years (a ``profile-standart`` / ``profile-rapid`` /
 We try a couple of strategies and treat a rating of 0 / non-numeric / absent as
 "not rated" -> ``None``.
 """
+import logging
 import re
 
 __all__ = ["parse_profile_html", "fetch_profile_html", "lookup_ratings",
            "FIDE_PROFILE_URL"]
+
+# Module logger, consistent with auth.py (logging.getLogger(__name__)). Used to
+# make the network + glue path diagnosable in production without logging any
+# sensitive data.
+_log = logging.getLogger(__name__)
 
 # Public profile page. %s is the numeric FIDE ID.
 FIDE_PROFILE_URL = "https://ratings.fide.com/profile/%s"
@@ -67,22 +73,46 @@ def _clean_rating(value):
     return n
 
 
-# Strategy A: the modern profile layout renders each rating inside a block whose
-# class names the time control, e.g.
-#   <div class="profile-standart"><span class="...">1611</span> std</div>
+# Strategy A (primary, matches the CURRENT ratings.fide.com layout): each rating
+# lives inside a block whose class names the time control, and the number is the
+# content of the FIRST <p>...</p> inside that block; a SECOND <p> holds the
+# label, e.g.
+#   <div class="profile-standart profile-game ">
+#       <img src="/img/logo_std.svg" alt="standart" height="25">
+#       <p>2019</p><p style="...">STANDARD</p>
+#   </div>
 # FIDE historically MISSPELLS standard as "standart"; accept both spellings.
-# We capture the FIRST run of >=3 digits after the control's class name. The
-# rating lives inside the block's <span>; the class attribute may itself
-# contain hyphens/words (e.g. "profile-top-rating-data") but no 3+ digit runs,
-# so anchoring on the class then grabbing the first 3-4 digit number is safe.
-# A block with no such number (unrated: blank / "Not rated" / "0") yields no
-# match here -> None. NB: a bare "0" (unrated) is <3 digits so it is ignored.
-# The guard "(?:(?!profile-(?:standar[dt]|rapid|blitz)).)*?" stops the scan at
-# the NEXT rating-control block, so an unrated control (no number in its own
-# block) does NOT steal the next control's rating -> it correctly yields None.
-# Crucially it does NOT stop on unrelated "profile-*" classes (e.g. the
-# "profile-top-rating-data" span that actually WRAPS the number).
+# The class attribute may carry extra classes and trailing whitespace
+# ("profile-standart profile-game "), so we do NOT require the class to be the
+# only/last token -- we anchor on "profile-<control>" then scan to the first
+# <p>...</p>. Anchoring on the block's OWN first <p> (rather than the first run
+# of digits) is what makes this robust: it ignores numeric attributes that sit
+# between the class and the rating -- an <img> "height"/"width", a "data-id",
+# etc. -- which would otherwise be grabbed by mistake. It also cannot reach the
+# birth year (2011) or rank counts, which live outside these blocks.
+#
+# The guard "(?:(?!profile-(?:standar[dt]|rapid|blitz)).)*?" between the class
+# and the <p> stops the scan at the NEXT rating-control block, so an unrated
+# control whose own first <p> is empty/0 does NOT steal the next control's
+# rating -> it correctly yields None. _clean_rating rejects blank / "0" / "-"
+# / out-of-range so an unrated control resolves to None.
 _STOP = r"(?:(?!profile-(?:standar[dt]|rapid|blitz)).)*?"
+_BLOCK_P_PATTERNS = {
+    "classical": re.compile(
+        r"profile-standar[dt]\b" + _STOP + r"<p\b[^>]*>(.*?)</p>",
+        re.IGNORECASE | re.DOTALL),
+    "rapid": re.compile(
+        r"profile-rapid\b" + _STOP + r"<p\b[^>]*>(.*?)</p>",
+        re.IGNORECASE | re.DOTALL),
+    "blitz": re.compile(
+        r"profile-blitz\b" + _STOP + r"<p\b[^>]*>(.*?)</p>",
+        re.IGNORECASE | re.DOTALL),
+}
+
+# Strategy A' (backward-compatible fallback): older layouts put the rating in a
+# <span> right after the class rather than a <p>. Capture the FIRST run of >=3
+# digits after the control's class name. Kept as a fallback for markup that has
+# no <p> inside the block.
 _BLOCK_PATTERNS = {
     "classical": re.compile(
         r"profile-standar[dt]\b" + _STOP + r"(\d{3,4})",
@@ -125,9 +155,21 @@ def parse_profile_html(html):
         return out
     for control in ("classical", "rapid", "blitz"):
         rating = None
+        # Strategy A (primary): the control's own first <p> holds the rating.
+        m = _BLOCK_P_PATTERNS[control].search(html)
+        if m:
+            rating = _clean_rating(m.group(1))
+            # The block for this control was found. If its first <p> is
+            # empty / "0" / "-" (unrated), _clean_rating -> None and we keep
+            # None for THIS control rather than falling through to a looser
+            # strategy that could grab an unrelated number.
+            out[control] = rating
+            continue
+        # Strategy A' (fallback): older <span>-based block layout.
         m = _BLOCK_PATTERNS[control].search(html)
         if m:
             rating = _clean_rating(m.group(1))
+        # Strategy B (fallback): a "label then number" table/list layout.
         if rating is None:
             m = _LABEL_PATTERNS[control].search(html)
             if m:
@@ -150,16 +192,25 @@ def fetch_profile_html(fide_id, timeout=8):
     try:
         import requests  # imported lazily so the offline path needs no network dep
     except Exception:  # pragma: no cover - requests is a declared dependency
+        _log.warning("FIDE lookup for id=%s: 'requests' unavailable", fid)
         return None
     url = FIDE_PROFILE_URL % fid
     try:
         resp = requests.get(
             url, timeout=timeout,
             headers={"User-Agent": "Mozilla/5.0 (ChessAmateur signup FIDE lookup)"})
-    except Exception:  # pragma: no cover - network failures are non-fatal
+    except Exception as exc:  # pragma: no cover - network failures are non-fatal
+        # Log the failure so a deploy can tell "could not reach FIDE" apart from
+        # "fetched but parsed nothing". No sensitive data: just the id + error.
+        _log.warning("FIDE fetch failed for id=%s: %s: %s",
+                     fid, type(exc).__name__, exc)
         return None
     if resp.status_code != 200:
+        _log.warning("FIDE fetch for id=%s returned HTTP %s",
+                     fid, resp.status_code)
         return None
+    _log.info("FIDE fetch for id=%s: HTTP %s, %d bytes",
+              fid, resp.status_code, len(resp.text or ""))
     return resp.text
 
 
@@ -195,11 +246,21 @@ def lookup_ratings(fide_id, fetcher=None):
     fetch = fetcher or fetch_profile_html
     try:
         html = fetch(fid)
-    except Exception:  # pragma: no cover - defensive; fetcher should not raise
+    except Exception as exc:  # pragma: no cover - defensive; fetcher should not raise
+        _log.warning("FIDE lookup id=%s: fetcher raised %s: %s",
+                     fid, type(exc).__name__, exc)
         return dict(all_none)
     if not html:
+        # Never fetched (or empty body): every control falls back to 1400.
+        _log.info("FIDE lookup id=%s: no page fetched; ratings=%s",
+                  fid, all_none)
         return dict(all_none)
     try:
-        return parse_profile_html(html)
-    except Exception:  # pragma: no cover - parse_profile_html already guards
+        ratings = parse_profile_html(html)
+    except Exception as exc:  # pragma: no cover - parse_profile_html already guards
+        _log.warning("FIDE lookup id=%s: parse raised %s: %s",
+                     fid, type(exc).__name__, exc)
         return dict(all_none)
+    # Distinguish fetched-but-parsed-empty from fetched-and-parsed-values.
+    _log.info("FIDE lookup id=%s: parsed ratings=%s", fid, ratings)
+    return ratings
